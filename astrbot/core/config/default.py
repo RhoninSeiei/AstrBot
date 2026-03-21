@@ -1776,6 +1776,11 @@ CONFIG_METADATA_2 = {
                         "items": {},
                         "hint": "此处添加的键值对将被合并到 OpenAI SDK 的 default_headers 中，用于自定义 HTTP 请求头。值必须为字符串。",
                     },
+                    "ollama_disable_thinking": {
+                        "description": "关闭思考模式",
+                        "type": "bool",
+                        "hint": "关闭 Ollama 思考模式。",
+                    },
                     "auth_mode": {
                         "description": "认证方式",
                         "type": "string",
