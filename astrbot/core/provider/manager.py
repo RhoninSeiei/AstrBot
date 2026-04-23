@@ -363,11 +363,11 @@ class ProviderManager:
                 )
             case "longcat_chat_completion":
                 from .sources.longcat_source import ProviderLongCat as ProviderLongCat
-            case openai_oauth_chat_completion:
+            case "openai_oauth_chat_completion":
                 from .sources.openai_oauth_source import (
                     ProviderOpenAIOAuth as ProviderOpenAIOAuth,
                 )
-            case minimax_token_plan:
+            case "minimax_token_plan":
                 from .sources.minimax_token_plan_source import (
                     ProviderMiniMaxTokenPlan as ProviderMiniMaxTokenPlan,
                 )
