@@ -508,7 +508,34 @@ class ProviderManager:
                     NvidiaRerankProvider as NvidiaRerankProvider,
                 )
 
-    def get_merged_provider_config(self, provider_config: dict) -> dict:
+    async def _persist_openai_oauth_provider_source_patch(
+        self,
+        provider_source_id: str,
+        patch: dict,
+    ) -> None:
+        async with self.resource_lock:
+            config = self.acm.default_conf
+            provider_sources = config.get("provider_sources", [])
+            updated_source = None
+            for source in provider_sources:
+                if source.get("id") != provider_source_id:
+                    continue
+                source.update(copy.deepcopy(patch))
+                updated_source = source
+                break
+            if updated_source is None:
+                raise ValueError(f"Provider source {provider_source_id} not found")
+
+            self.provider_sources_config = provider_sources
+            astrbot_config["provider_sources"] = provider_sources
+            config.save_config()
+
+    def get_merged_provider_config(
+        self,
+        provider_config: dict,
+        *,
+        runtime: bool = False,
+    ) -> dict:
         """获取 provider 配置和 provider_source 配置合并后的结果
 
         Returns:
@@ -542,11 +569,18 @@ class ProviderManager:
                     and merged_config.get("type") == "openai_oauth_chat_completion"
                     and merged_config.get("auth_mode") == "openai_oauth"
                 ):
-                    access_token = (
-                        merged_config.get("oauth_access_token") or ""
-                    ).strip()
-                    if access_token:
-                        merged_config["key"] = [access_token]
+                    merged_config["key"] = ["__openai_oauth__"]
+                    if runtime:
+                        async def persist_callback(
+                            patch: dict,
+                            source_id: str = provider_source_id,
+                        ) -> None:
+                            await self._persist_openai_oauth_provider_source_patch(
+                                source_id,
+                                patch,
+                            )
+
+                        merged_config["oauth_persist_callback"] = persist_callback
                 pc = merged_config
         return pc
 
@@ -599,7 +633,7 @@ class ProviderManager:
 
     async def load_provider(self, provider_config: dict) -> None:
         # 如果 provider_source_id 存在且不为空，则从 provider_sources 中找到对应的配置并合并
-        provider_config = self.get_merged_provider_config(provider_config)
+        provider_config = self.get_merged_provider_config(provider_config, runtime=True)
 
         if provider_config.get("provider_type", "") == "chat_completion":
             provider_config = self._resolve_env_key_list(provider_config)
