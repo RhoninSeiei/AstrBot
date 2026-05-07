@@ -1,22 +1,251 @@
+import base64
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 import pytest
 
+from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
+import astrbot.core.provider.sources.openai_oauth_source as oauth_source
 from astrbot.core.provider.sources.openai_oauth_source import ProviderOpenAIOAuth
 
 
-def _make_provider(overrides: dict | None = None) -> ProviderOpenAIOAuth:
+def _jwt_with_claims(claims: dict) -> str:
+    header = {"alg": "none", "typ": "JWT"}
+
+    def encode(value: dict) -> str:
+        data = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+    return f"{encode(header)}.{encode(claims)}."
+
+
+def _make_provider(
+    overrides: dict | None = None,
+    *,
+    persist_callback=None,
+) -> ProviderOpenAIOAuth:
     provider_config = {
         "id": "test-openai-oauth",
         "type": "openai_oauth_chat_completion",
         "model": "gpt-5.4",
         "oauth_access_token": "test-token",
+        "oauth_refresh_token": "test-refresh",
         "oauth_account_id": "test-account",
     }
     if overrides:
         provider_config.update(overrides)
+    if persist_callback is not None:
+        provider_config["oauth_persist_callback"] = persist_callback
     return ProviderOpenAIOAuth(
         provider_config=provider_config,
         provider_settings={},
     )
+
+
+def test_oauth_provider_keeps_access_token_out_of_key_pool():
+    provider = _make_provider()
+    try:
+        assert provider.get_keys() == ["__openai_oauth__"]
+        assert provider.get_current_key() == "__openai_oauth__"
+        assert provider.provider_config["oauth_access_token"] == "test-token"
+        assert provider.chosen_api_key == ""
+    finally:
+        # AsyncOpenAI.close is async; this test does not perform network IO.
+        pass
+
+
+def test_parse_codex_auth_json_tokens_object():
+    access_token = _jwt_with_claims(
+        {
+            "email": "codex@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc_codex",
+            },
+        }
+    )
+    id_token = _jwt_with_claims({"email": "fallback@example.com"})
+    raw = json.dumps(
+        {
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "id_token": id_token,
+                "expires_at": "2026-05-07T12:00:00Z",
+            }
+        }
+    )
+
+    parsed = parse_oauth_credential_json(raw)
+
+    assert parsed is not None
+    assert parsed["access_token"] == access_token
+    assert parsed["refresh_token"] == "refresh-token"
+    assert parsed["expires_at"] == "2026-05-07T12:00:00+00:00"
+    assert parsed["email"] == "codex@example.com"
+    assert parsed["account_id"] == "acc_codex"
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_oauth_token_refreshes_and_persists(monkeypatch):
+    persisted: list[dict] = []
+
+    async def persist_callback(patch: dict):
+        persisted.append(patch)
+
+    async def fake_refresh(refresh_token: str, proxy_url: str = ""):
+        assert refresh_token == "test-refresh"
+        assert proxy_url == "http://proxy.local"
+        return {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "email": "new@example.com",
+            "account_id": "new-account",
+        }
+
+    monkeypatch.setattr(oauth_source, "refresh_access_token", fake_refresh)
+    provider = _make_provider(
+        {
+            "proxy": "http://proxy.local",
+            "oauth_expires_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        },
+        persist_callback=persist_callback,
+    )
+    try:
+        await provider._ensure_fresh_oauth_token()
+
+        assert provider.provider_config["oauth_access_token"] == "new-access"
+        assert provider.provider_config["oauth_refresh_token"] == "new-refresh"
+        assert provider.account_id == "new-account"
+        assert provider.chosen_api_key == ""
+        assert persisted == [
+            {
+                "auth_mode": "openai_oauth",
+                "oauth_provider": "openai",
+                "oauth_access_token": "new-access",
+                "oauth_refresh_token": "new-refresh",
+                "oauth_expires_at": provider.provider_config["oauth_expires_at"],
+                "oauth_account_email": "new@example.com",
+                "oauth_account_id": "new-account",
+            }
+        ]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_request_backend_refreshes_once_after_401(monkeypatch):
+    calls = {"refresh": 0}
+
+    async def fake_refresh(refresh_token: str, proxy_url: str = ""):
+        calls["refresh"] += 1
+        return {
+            "access_token": "retried-access",
+            "refresh_token": "retried-refresh",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "email": "",
+            "account_id": "retried-account",
+        }
+
+    class FakeResponse:
+        def __init__(self, status_code: int, text: str):
+            self.status_code = status_code
+            self._text = text
+
+        async def aread(self):
+            return self._text.encode()
+
+    class FakeClient:
+        responses = [
+            FakeResponse(401, '{"error":{"message":"expired"}}'),
+            FakeResponse(
+                200,
+                'data: {"type":"response.completed","response":{"id":"resp_ok","output_text":"OK","output":[]}}\n\n',
+            ),
+        ]
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(oauth_source, "refresh_access_token", fake_refresh)
+    monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
+    provider = _make_provider()
+    try:
+        response = await provider._request_backend(
+            {"model": "gpt-5.4", "input": "ping"}
+        )
+
+        assert calls["refresh"] == 1
+        assert response["id"] == "resp_ok"
+        assert provider.provider_config["oauth_access_token"] == "retried-access"
+        assert provider.provider_config["oauth_account_id"] == "retried-account"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_extracts_base64_result(tmp_path):
+    image_bytes = b"\x89PNG\r\n\x1a\nsample"
+    requested_payloads: list[dict] = []
+    provider = _make_provider(
+        {
+            "generated_image_dir": str(tmp_path),
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode(),
+                    "revised_prompt": "revised",
+                }
+            ]
+        }
+
+    provider._request_backend = fake_request_backend
+    try:
+        results = await provider.generate_image(
+            prompt="draw a small icon",
+            model="gpt-5.4",
+            size="1024x1024",
+        )
+
+        assert requested_payloads[0]["tools"] == [
+            {
+                "type": "image_generation",
+                "action": "generate",
+                "size": "1024x1024",
+            }
+        ]
+        assert requested_payloads[0]["tool_choice"] == {"type": "image_generation"}
+        assert len(results) == 1
+        assert results[0].mime_type == "image/png"
+        assert results[0].revised_prompt == "revised"
+        assert Path(results[0].path).read_bytes() == image_bytes
+    finally:
+        await provider.terminate()
 
 
 @pytest.mark.asyncio
