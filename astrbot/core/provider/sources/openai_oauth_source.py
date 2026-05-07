@@ -1,5 +1,12 @@
+import asyncio
+import base64
+import inspect
 import json
+import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -7,9 +14,21 @@ import httpx
 from astrbot import logger
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
+from astrbot.core.provider.oauth.openai_oauth import refresh_access_token
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ..register import register_provider_adapter
 from .openai_source import ProviderOpenAIOfficial
+
+OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
+
+
+@dataclass
+class OpenAIOAuthImageResult:
+    path: str
+    mime_type: str = "image/png"
+    revised_prompt: str = ""
+    raw: dict[str, Any] | None = None
 
 
 @register_provider_adapter(
@@ -17,25 +36,40 @@ from .openai_source import ProviderOpenAIOfficial
     "OpenAI OAuth / ChatGPT Codex 提供商适配器",
 )
 class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
+    capabilities = {
+        "chat": True,
+        "stream": False,
+        "vision_input": True,
+        "function_call": True,
+        "reasoning": True,
+        "image_generate": True,
+        "image_edit": False,
+    }
+
     def __init__(self, provider_config, provider_settings) -> None:
         patched_config = dict(provider_config)
-        access_token = (patched_config.get("oauth_access_token") or "").strip()
-        if access_token:
-            patched_config["key"] = [access_token]
+        patched_config["key"] = [OAUTH_PLACEHOLDER_KEY]
         super().__init__(patched_config, provider_settings)
-        self.provider_config = patched_config
-        self.api_keys = [access_token] if access_token else self.api_keys
-        self.chosen_api_key = access_token or (
-            self.api_keys[0] if self.api_keys else ""
-        )
+        self.provider_config = dict(provider_config)
+        self.provider_config["key"] = [OAUTH_PLACEHOLDER_KEY]
+        self.api_keys = [OAUTH_PLACEHOLDER_KEY]
+        self.chosen_api_key = ""
         self.account_id = (
-            patched_config.get("oauth_account_id")
-            or patched_config.get("account_id")
+            self.provider_config.get("oauth_account_id")
+            or self.provider_config.get("account_id")
             or ""
         ).strip()
         self.base_url = (
-            patched_config.get("api_base") or "https://chatgpt.com/backend-api/codex"
+            self.provider_config.get("api_base")
+            or "https://chatgpt.com/backend-api/codex"
         ).rstrip("/")
+        self._oauth_refresh_lock = asyncio.Lock()
+        self._oauth_refresh_skew_seconds = int(
+            self.provider_config.get("oauth_refresh_skew_seconds") or 300
+        )
+        self._oauth_persist_callback = self.provider_config.get(
+            "oauth_persist_callback"
+        )
 
     async def get_models(self):
         logger.info(
@@ -44,10 +78,96 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         )
         return []
 
-    async def _request_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
-        access_token = (
-            self.provider_config.get("oauth_access_token") or self.chosen_api_key or ""
+    def _parse_oauth_expires_at(self) -> datetime | None:
+        value = (self.provider_config.get("oauth_expires_at") or "").strip()
+        if not value:
+            return None
+        try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except Exception:
+            return None
+
+    def _oauth_expiring_soon(self) -> bool:
+        expires_at = self._parse_oauth_expires_at()
+        if expires_at is None:
+            return False
+        refresh_at = datetime.now(timezone.utc) + timedelta(
+            seconds=self._oauth_refresh_skew_seconds
+        )
+        return expires_at <= refresh_at
+
+    def _apply_oauth_token_to_runtime(self, token: dict[str, Any]) -> None:
+        access_token = str(token.get("access_token") or "").strip()
+        refresh_token = str(token.get("refresh_token") or "").strip()
+        if access_token:
+            self.provider_config["oauth_access_token"] = access_token
+        if refresh_token:
+            self.provider_config["oauth_refresh_token"] = refresh_token
+        self.provider_config["oauth_expires_at"] = str(token.get("expires_at") or "")
+        self.provider_config["oauth_account_email"] = (
+            str(token.get("email") or "")
+            or self.provider_config.get("oauth_account_email", "")
+        )
+        self.provider_config["oauth_account_id"] = (
+            str(token.get("account_id") or "")
+            or self.provider_config.get("oauth_account_id", "")
+        )
+        self.account_id = self.provider_config.get("oauth_account_id", "")
+        self.api_keys = [OAUTH_PLACEHOLDER_KEY]
+        self.chosen_api_key = ""
+        self.client.api_key = OAUTH_PLACEHOLDER_KEY
+
+    async def _refresh_oauth_token(self) -> bool:
+        refresh_token_value = (
+            self.provider_config.get("oauth_refresh_token") or ""
         ).strip()
+        if not refresh_token_value:
+            return False
+
+        token = await refresh_access_token(
+            refresh_token_value,
+            self.provider_config.get("proxy", ""),
+        )
+        self._apply_oauth_token_to_runtime(token)
+
+        persist_callback = self._oauth_persist_callback
+        if callable(persist_callback):
+            patch = {
+                "auth_mode": "openai_oauth",
+                "oauth_provider": "openai",
+                "oauth_access_token": self.provider_config["oauth_access_token"],
+                "oauth_refresh_token": self.provider_config["oauth_refresh_token"],
+                "oauth_expires_at": self.provider_config["oauth_expires_at"],
+                "oauth_account_email": self.provider_config.get(
+                    "oauth_account_email", ""
+                ),
+                "oauth_account_id": self.provider_config.get(
+                    "oauth_account_id", ""
+                ),
+            }
+            result = persist_callback(patch)
+            if inspect.isawaitable(result):
+                await result
+        return True
+
+    async def _ensure_fresh_oauth_token(self) -> None:
+        if not self._oauth_expiring_soon():
+            return
+        async with self._oauth_refresh_lock:
+            if not self._oauth_expiring_soon():
+                return
+            await self._refresh_oauth_token()
+
+    async def _request_backend_once(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int, str]:
+        access_token = (self.provider_config.get("oauth_access_token") or "").strip()
         account_id = (
             self.provider_config.get("oauth_account_id") or self.account_id or ""
         ).strip()
@@ -83,8 +203,20 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             )
             raw_text = await response.aread()
         text = raw_text.decode("utf-8", errors="replace")
-        if response.status_code < 200 or response.status_code >= 300:
-            raise Exception(self._format_backend_error(response.status_code, text))
+        return response.status_code, text
+
+    async def _request_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
+        await self._ensure_fresh_oauth_token()
+        status_code, text = await self._request_backend_once(payload)
+
+        if status_code in {401, 403}:
+            async with self._oauth_refresh_lock:
+                refreshed = await self._refresh_oauth_token()
+            if refreshed:
+                status_code, text = await self._request_backend_once(payload)
+
+        if status_code < 200 or status_code >= 300:
+            raise Exception(self._format_backend_error(status_code, text))
         return self._parse_backend_response(text)
 
     def _format_backend_error(self, status_code: int, text: str) -> str:
@@ -495,6 +627,102 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         params.pop("temperature", None)
         response = await self._request_backend(params)
         return await self._parse_responses_completion(response, tools)
+
+    async def generate_image(
+        self,
+        prompt: str,
+        model: str | None = None,
+        size: str | None = None,
+        n: int = 1,
+        reference_images: list[str] | None = None,
+    ) -> list[OpenAIOAuthImageResult]:
+        if reference_images:
+            raise NotImplementedError("账号态 OAuth 生图暂未支持参考图输入。")
+
+        results: list[OpenAIOAuthImageResult] = []
+        count = max(1, int(n or 1))
+        for _ in range(count):
+            tool: dict[str, Any] = {
+                "type": "image_generation",
+                "action": "generate",
+            }
+            if size:
+                tool["size"] = size
+            payload = {
+                "model": model or self.get_model(),
+                "input": prompt,
+                "tools": [tool],
+                "tool_choice": {"type": "image_generation"},
+                "stream": False,
+                "store": False,
+            }
+            response = await self._request_backend(payload)
+            results.extend(await self._extract_generated_images(response))
+        return results
+
+    async def _extract_generated_images(
+        self,
+        response: dict[str, Any],
+    ) -> list[OpenAIOAuthImageResult]:
+        output = response.get("output") or []
+        if not isinstance(output, list):
+            output = []
+
+        image_dir_value = self.provider_config.get("generated_image_dir")
+        image_dir = (
+            Path(str(image_dir_value))
+            if image_dir_value
+            else Path(get_astrbot_data_path()) / "generated" / "openai_oauth_images"
+        )
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        results: list[OpenAIOAuthImageResult] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            image_base64 = self._extract_image_base64_from_output_item(item)
+            if not image_base64:
+                continue
+            if "," in image_base64 and image_base64.startswith("data:"):
+                image_base64 = image_base64.split(",", 1)[1]
+            file_path = image_dir / f"{uuid.uuid4().hex}.png"
+            file_path.write_bytes(base64.b64decode(image_base64))
+            results.append(
+                OpenAIOAuthImageResult(
+                    path=str(file_path),
+                    mime_type="image/png",
+                    revised_prompt=str(item.get("revised_prompt") or ""),
+                    raw=item,
+                )
+            )
+
+        if not results:
+            raise Exception(f"Codex 图像生成响应未包含可提取图片：{response}")
+        return results
+
+    def _extract_image_base64_from_output_item(self, item: dict[str, Any]) -> str:
+        if item.get("type") == "image_generation_call":
+            value = item.get("result")
+            if value:
+                return str(value)
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return ""
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in {"output_image", "image"}:
+                continue
+            value = (
+                part.get("image_base64")
+                or part.get("b64_json")
+                or part.get("data")
+                or ""
+            )
+            if value:
+                return str(value)
+        return ""
 
     async def text_chat_stream(
         self,
