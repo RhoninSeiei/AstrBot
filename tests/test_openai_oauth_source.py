@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
 import astrbot.core.provider.sources.openai_oauth_source as oauth_source
+from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
 from astrbot.core.provider.sources.openai_oauth_source import ProviderOpenAIOAuth
 
 
@@ -244,6 +244,113 @@ async def test_generate_image_extracts_base64_result(tmp_path):
         assert results[0].mime_type == "image/png"
         assert results[0].revised_prompt == "revised"
         assert Path(results[0].path).read_bytes() == image_bytes
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_path):
+    source_image_bytes = b"\x89PNG\r\n\x1a\nreference"
+    output_image_bytes = b"\x89PNG\r\n\x1a\noutput"
+    source_path = tmp_path / "reference.png"
+    source_path.write_bytes(source_image_bytes)
+    requested_payloads: list[dict] = []
+    provider = _make_provider(
+        {
+            "generated_image_dir": str(tmp_path / "generated"),
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(output_image_bytes).decode(),
+                }
+            ]
+        }
+
+    provider._request_backend = fake_request_backend
+    try:
+        results = await provider.generate_image(
+            prompt="keep the subject and change the background",
+            model="gpt-5.4",
+            size="1024x1024",
+            reference_images=[str(source_path)],
+        )
+
+        payload = requested_payloads[0]
+        assert payload["tools"] == [
+            {
+                "type": "image_generation",
+                "action": "edit",
+                "size": "1024x1024",
+            }
+        ]
+        assert payload["input"] == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "keep the subject and change the background",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": (
+                            "data:image/png;base64,"
+                            + base64.b64encode(source_image_bytes).decode()
+                        ),
+                    },
+                ],
+            }
+        ]
+        assert Path(results[0].path).read_bytes() == output_image_bytes
+        assert provider.capabilities["image_edit"] is True
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
+    output_image_bytes = b"\x89PNG\r\n\x1a\noutput"
+    data_url = "data:image/jpeg;base64," + base64.b64encode(b"jpeg").decode()
+    requested_payloads: list[dict] = []
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(output_image_bytes).decode(),
+                }
+            ]
+        }
+
+    provider._request_backend = fake_request_backend
+    try:
+        await provider.generate_image(
+            prompt="turn this into a watercolor illustration",
+            reference_images=[data_url],
+            action="auto",
+        )
+
+        payload = requested_payloads[0]
+        assert payload["tools"] == [
+            {
+                "type": "image_generation",
+                "action": "auto",
+            }
+        ]
+        assert payload["input"][0]["content"][1] == {
+            "type": "input_image",
+            "image_url": data_url,
+        }
     finally:
         await provider.terminate()
 
