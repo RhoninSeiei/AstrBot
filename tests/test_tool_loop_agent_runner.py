@@ -949,6 +949,69 @@ async def test_same_tool_streak_resets_when_arguments_change(
 
 
 @pytest.mark.asyncio
+async def test_same_tool_streak_treats_none_args_as_empty_dict(
+    runner, mock_tool_executor, mock_hooks
+):
+    runner_cls = type(runner)
+    total_calls = runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD
+
+    class NoneAndEmptyArgsProvider(MockProvider):
+        async def text_chat(self, **kwargs) -> LLMResponse:
+            self.call_count += 1
+            func_tool = kwargs.get("func_tool")
+            if func_tool is None or self.call_count > total_calls:
+                return LLMResponse(
+                    role="assistant",
+                    completion_text="这是我的最终回答",
+                    usage=TokenUsage(input_other=10, output=5),
+                )
+
+            return LLMResponse(
+                role="assistant",
+                completion_text="",
+                tools_call_name=["test_tool"],
+                tools_call_args=[None if self.call_count % 2 else {}],
+                tools_call_ids=[f"call_{self.call_count}"],
+                usage=TokenUsage(input_other=10, output=5),
+            )
+
+    tool = FunctionTool(
+        name="test_tool",
+        description="测试工具",
+        parameters={"type": "object", "properties": {}},
+        handler=AsyncMock(),
+    )
+    request = ProviderRequest(
+        prompt="请连续执行空参数工具",
+        func_tool=ToolSet(tools=[tool]),
+        contexts=[],
+    )
+
+    await runner.reset(
+        provider=NoneAndEmptyArgsProvider(),
+        request=request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+    )
+
+    async for _ in runner.step_until_done(total_calls + 1):
+        pass
+
+    tool_messages = [
+        m for m in runner.run_context.messages if getattr(m, "role", None) == "tool"
+    ]
+    assert len(tool_messages) == total_calls
+
+    level_1_notice = runner_cls.REPEATED_TOOL_NOTICE_L1_TEMPLATE.format(
+        tool_name="test_tool",
+        streak=runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD,
+    )
+    assert level_1_notice in str(tool_messages[-1].content)
+
+
+@pytest.mark.asyncio
 async def test_same_tool_streak_resets_after_switching_tools(
     runner, mock_tool_executor, mock_hooks
 ):
