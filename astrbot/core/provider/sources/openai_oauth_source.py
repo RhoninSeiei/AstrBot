@@ -641,7 +641,10 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         references = [
             str(image).strip() for image in reference_images or [] if str(image).strip()
         ]
-        image_input = self._build_image_generation_input(prompt, references)
+        instructions = str(prompt or "").strip()
+        if not instructions:
+            raise ValueError("图片生成提示词不能为空。")
+        image_input = self._build_image_generation_input(references)
         image_action = (action or ("edit" if references else "generate")).strip()
         if not image_action:
             image_action = "edit" if references else "generate"
@@ -657,9 +660,10 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             payload = {
                 "model": model or self.get_model(),
                 "input": image_input,
+                "instructions": instructions,
                 "tools": [tool],
                 "tool_choice": {"type": "image_generation"},
-                "stream": False,
+                "stream": True,
                 "store": False,
             }
             response = await self._request_backend(payload)
@@ -668,27 +672,20 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
     def _build_image_generation_input(
         self,
-        prompt: str,
         reference_images: list[str],
-    ) -> str | list[dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         image_parts = [
             self._reference_image_to_input_part(image)
             for image in reference_images
             if str(image or "").strip()
         ]
         if not image_parts:
-            return prompt
+            return []
         return [
             {
                 "type": "message",
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": str(prompt or ""),
-                    },
-                    *image_parts,
-                ],
+                "content": image_parts,
             }
         ]
 
