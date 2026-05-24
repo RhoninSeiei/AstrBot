@@ -232,7 +232,11 @@ async def test_generate_image_extracts_base64_result(tmp_path):
             size="1024x1024",
         )
 
-        assert requested_payloads[0]["tools"] == [
+        payload = requested_payloads[0]
+        assert payload["instructions"] == "draw a small icon"
+        assert payload["input"] == []
+        assert payload["stream"] is True
+        assert payload["tools"] == [
             {
                 "type": "image_generation",
                 "action": "generate",
@@ -282,6 +286,10 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
         )
 
         payload = requested_payloads[0]
+        assert (
+            payload["instructions"] == "keep the subject and change the background"
+        )
+        assert payload["stream"] is True
         assert payload["tools"] == [
             {
                 "type": "image_generation",
@@ -294,10 +302,6 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
                 "type": "message",
                 "role": "user",
                 "content": [
-                    {
-                        "type": "input_text",
-                        "text": "keep the subject and change the background",
-                    },
                     {
                         "type": "input_image",
                         "image_url": (
@@ -341,13 +345,15 @@ async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
         )
 
         payload = requested_payloads[0]
+        assert payload["instructions"] == "turn this into a watercolor illustration"
+        assert payload["stream"] is True
         assert payload["tools"] == [
             {
                 "type": "image_generation",
                 "action": "auto",
             }
         ]
-        assert payload["input"][0]["content"][1] == {
+        assert payload["input"][0]["content"][0] == {
             "type": "input_image",
             "image_url": data_url,
         }
