@@ -644,7 +644,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         instructions = str(prompt or "").strip()
         if not instructions:
             raise ValueError("图片生成提示词不能为空。")
-        image_input = self._build_image_generation_input(references)
+        image_input = self._build_image_generation_input(instructions, references)
         image_action = (action or ("edit" if references else "generate")).strip()
         if not image_action:
             image_action = "edit" if references else "generate"
@@ -672,6 +672,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
     def _build_image_generation_input(
         self,
+        prompt: str,
         reference_images: list[str],
     ) -> list[dict[str, Any]]:
         image_parts = [
@@ -679,13 +680,17 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             for image in reference_images
             if str(image or "").strip()
         ]
-        if not image_parts:
-            return []
         return [
             {
                 "type": "message",
                 "role": "user",
-                "content": image_parts,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    },
+                    *image_parts,
+                ],
             }
         ]
 
