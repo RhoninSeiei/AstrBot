@@ -663,7 +663,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 "instructions": instructions,
                 "tools": [tool],
                 "tool_choice": {"type": "image_generation"},
-                "stream": True,
+                "stream": False,
                 "store": False,
             }
             response = await self._request_backend(payload)
