@@ -212,7 +212,7 @@ async def test_generate_image_extracts_base64_result(tmp_path):
         }
     )
 
-    async def fake_request_backend(payload: dict):
+    async def fake_request_image_backend(payload: dict):
         requested_payloads.append(payload)
         return {
             "output": [
@@ -224,7 +224,7 @@ async def test_generate_image_extracts_base64_result(tmp_path):
             ]
         }
 
-    provider._request_backend = fake_request_backend
+    provider._request_image_backend = fake_request_image_backend
     try:
         results = await provider.generate_image(
             prompt="draw a small icon",
@@ -246,7 +246,7 @@ async def test_generate_image_extracts_base64_result(tmp_path):
                 ],
             },
         ]
-        assert payload["stream"] is False
+        assert payload["stream"] is True
         assert payload["tools"] == [
             {
                 "type": "image_generation",
@@ -276,7 +276,7 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
         }
     )
 
-    async def fake_request_backend(payload: dict):
+    async def fake_request_image_backend(payload: dict):
         requested_payloads.append(payload)
         return {
             "output": [
@@ -287,7 +287,7 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
             ]
         }
 
-    provider._request_backend = fake_request_backend
+    provider._request_image_backend = fake_request_image_backend
     try:
         results = await provider.generate_image(
             prompt="keep the subject and change the background",
@@ -300,7 +300,7 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
         assert (
             payload["instructions"] == "keep the subject and change the background"
         )
-        assert payload["stream"] is False
+        assert payload["stream"] is True
         assert payload["tools"] == [
             {
                 "type": "image_generation",
@@ -340,7 +340,7 @@ async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
     requested_payloads: list[dict] = []
     provider = _make_provider({"generated_image_dir": str(tmp_path)})
 
-    async def fake_request_backend(payload: dict):
+    async def fake_request_image_backend(payload: dict):
         requested_payloads.append(payload)
         return {
             "output": [
@@ -351,7 +351,7 @@ async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
             ]
         }
 
-    provider._request_backend = fake_request_backend
+    provider._request_image_backend = fake_request_image_backend
     try:
         await provider.generate_image(
             prompt="turn this into a watercolor illustration",
@@ -361,7 +361,7 @@ async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
 
         payload = requested_payloads[0]
         assert payload["instructions"] == "turn this into a watercolor illustration"
-        assert payload["stream"] is False
+        assert payload["stream"] is True
         assert payload["tools"] == [
             {
                 "type": "image_generation",
@@ -376,6 +376,87 @@ async def test_generate_image_with_data_url_reference_keeps_data_url(tmp_path):
             "type": "input_image",
             "image_url": data_url,
         }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_reads_sse_incrementally(monkeypatch, tmp_path):
+    image_bytes = b"\x89PNG\r\n\x1a\nstreamed"
+    image_base64 = base64.b64encode(image_bytes).decode()
+    sent_requests: list[dict] = []
+
+    class FakeStreamResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aread(self):
+            raise AssertionError("image generation should not read the full SSE body")
+
+        async def aiter_lines(self):
+            yield "event: response.output_item.done"
+            yield (
+                'data: {"type":"response.output_item.done","item":'
+                '{"id":"ig_test","type":"image_generation_call",'
+                f'"result":"{image_base64}","revised_prompt":"streamed prompt"}}'
+                ',"output_index":0}'
+            )
+            yield ""
+            yield "event: response.completed"
+            yield (
+                'data: {"type":"response.completed","response":'
+                '{"id":"resp_img","output":[]}}'
+            )
+            yield ""
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("image generation should use an SSE stream")
+
+        def stream(self, method, url, **kwargs):
+            sent_requests.append(
+                {
+                    "method": method,
+                    "url": url,
+                    **kwargs,
+                }
+            )
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+    try:
+        results = await provider.generate_image("draw from streaming response")
+
+        assert sent_requests[0]["method"] == "POST"
+        assert sent_requests[0]["json"]["stream"] is True
+        assert sent_requests[0]["json"]["instructions"] == "draw from streaming response"
+        assert sent_requests[0]["json"]["tools"] == [
+            {
+                "type": "image_generation",
+                "action": "generate",
+            }
+        ]
+        assert len(results) == 1
+        assert results[0].revised_prompt == "streamed prompt"
+        assert Path(results[0].path).read_bytes() == image_bytes
     finally:
         await provider.terminate()
 

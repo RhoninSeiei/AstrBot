@@ -220,6 +220,86 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             raise Exception(self._format_backend_error(status_code, text))
         return self._parse_backend_response(text)
 
+    async def _request_image_backend_once(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int, str]:
+        access_token = (self.provider_config.get("oauth_access_token") or "").strip()
+        account_id = (
+            self.provider_config.get("oauth_account_id") or self.account_id or ""
+        ).strip()
+        if not access_token:
+            raise Exception("当前 OAuth Source 尚未绑定 access token")
+        if not account_id:
+            raise Exception(
+                "当前 OAuth Source 缺少 chatgpt_account_id，请重新绑定或导入完整 JSON 凭据"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "chatgpt-account-id": account_id,
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        custom_headers = self.provider_config.get("custom_headers")
+        if isinstance(custom_headers, dict):
+            for key, value in custom_headers.items():
+                headers[str(key)] = str(value)
+
+        text_parts: list[str] = []
+        async with httpx.AsyncClient(
+            proxy=self.provider_config.get("proxy") or None,
+            timeout=self.timeout,
+            follow_redirects=True,
+        ) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/responses",
+                headers=headers,
+                json=payload,
+            ) as response:
+                async for line in response.aiter_lines():
+                    text_parts.append(line)
+                    stripped = line.strip()
+                    if not stripped.startswith("data:"):
+                        continue
+                    raw = stripped[5:].strip()
+                    if not raw:
+                        continue
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = event.get("type")
+                    if event_type in {
+                        "response.completed",
+                        "response.error",
+                        "response.failed",
+                    }:
+                        break
+
+        return response.status_code, "\n".join(text_parts)
+
+    async def _request_image_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
+        await self._ensure_fresh_oauth_token()
+        status_code, text = await self._request_image_backend_once(payload)
+
+        if status_code in {401, 403}:
+            async with self._oauth_refresh_lock:
+                refreshed = await self._refresh_oauth_token()
+            if refreshed:
+                status_code, text = await self._request_image_backend_once(payload)
+
+        if status_code < 200 or status_code >= 300:
+            raise Exception(self._format_backend_error(status_code, text))
+        return self._parse_backend_response(text)
+
     def _format_backend_error(self, status_code: int, text: str) -> str:
         stripped = text.strip()
         if not stripped:
@@ -663,10 +743,10 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 "instructions": instructions,
                 "tools": [tool],
                 "tool_choice": {"type": "image_generation"},
-                "stream": False,
+                "stream": True,
                 "store": False,
             }
-            response = await self._request_backend(payload)
+            response = await self._request_image_backend(payload)
             results.extend(await self._extract_generated_images(response))
         return results
 
