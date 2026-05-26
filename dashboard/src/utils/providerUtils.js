@@ -35,6 +35,7 @@ export function getProviderIcon(type) {
     'minimax': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/minimax.svg',
     'minimax-token-plan': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/minimax.svg',
     'mimo': 'https://platform.xiaomimimo.com/favicon.874c9507.png',
+    'stepfun': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/stepfun-color.svg',
     '302ai': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@1.53.0/icons/ai302-color.svg',
     'microsoft': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/microsoft.svg',
     'vllm': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/vllm.svg',
