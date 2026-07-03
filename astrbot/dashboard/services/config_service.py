@@ -4,6 +4,7 @@ import asyncio
 import copy
 import inspect
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ PROTECTED_2FA_CONFIG_PATHS = (
     ("dashboard", "totp", "recovery_code_hash"),
 )
 MAX_FILE_BYTES = 500 * 1024 * 1024
+OPENAI_OAUTH_FLOW_TTL_SECONDS = 10 * 60
 
 
 def try_cast(value: Any, type_: str):
@@ -1284,7 +1286,7 @@ class ProviderConfigService:
         self.core_lifecycle = core_lifecycle
         self.config = core_lifecycle.astrbot_config
         self.provider_manager = core_lifecycle.provider_manager
-        self._provider_source_oauth_flows: dict[str, dict[str, str]] = {}
+        self._provider_source_oauth_flows: dict[str, dict[str, Any]] = {}
 
     def get_provider_schema(self) -> dict:
         provider_metadata = ConfigMetadataI18n.convert_to_i18n_keys(
@@ -1375,6 +1377,26 @@ class ProviderConfigService:
             and provider_source.get("type") == "openai_oauth_chat_completion"
         )
 
+    def _cleanup_expired_provider_source_oauth_flows(self) -> None:
+        now = time.time()
+        expired_source_ids = [
+            source_id
+            for source_id, flow in self._provider_source_oauth_flows.items()
+            if now - float(flow.get("created_at") or 0)
+            > OPENAI_OAUTH_FLOW_TTL_SECONDS
+        ]
+        for source_id in expired_source_ids:
+            self._provider_source_oauth_flows.pop(source_id, None)
+
+    def _create_provider_source_oauth_flow(self) -> dict[str, Any]:
+        flow = create_pkce_flow()
+        flow["created_at"] = time.time()
+        return flow
+
+    def _get_provider_source_oauth_flow(self, source_id: str) -> dict[str, Any] | None:
+        self._cleanup_expired_provider_source_oauth_flows()
+        return self._provider_source_oauth_flows.get(source_id)
+
     async def _persist_provider_source_patch(
         self,
         source_id: str,
@@ -1415,7 +1437,8 @@ class ProviderConfigService:
         if not self._is_openai_oauth_supported_source(provider_source):
             raise ValueError("Provider source does not support OpenAI OAuth")
 
-        flow = create_pkce_flow()
+        self._cleanup_expired_provider_source_oauth_flows()
+        flow = self._create_provider_source_oauth_flow()
         self._provider_source_oauth_flows[source_id] = flow
         return {
             "authorize_url": flow["authorize_url"],
@@ -1431,8 +1454,10 @@ class ProviderConfigService:
         if not source_id:
             raise ValueError("Missing source_id")
 
-        flow = self._provider_source_oauth_flows.get(source_id)
+        flow = self._get_provider_source_oauth_flow(source_id)
         provider_source = self._require_provider_source(source_id)
+        if not self._is_openai_oauth_supported_source(provider_source):
+            raise ValueError("Provider source does not support OpenAI OAuth")
         try:
             token = parse_oauth_credential_json(auth_input)
             if token is None:
