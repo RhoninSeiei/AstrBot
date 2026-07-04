@@ -20,6 +20,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ..register import register_provider_adapter
 from .openai_source import ProviderOpenAIOfficial
+from .request_retry import retry_provider_request
 
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
 
@@ -681,7 +682,13 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             llm_response.usage = usage
         return llm_response
 
-    async def _query(self, payloads: dict, tools) -> LLMResponse:
+    async def _query(
+        self,
+        payloads: dict,
+        tools,
+        *,
+        request_max_retries: int | None = None,
+    ) -> LLMResponse:
         instructions, backend_input = self._convert_messages_to_backend_input(
             payloads.get("messages", []) or []
         )
@@ -706,7 +713,11 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 params[key] = value
         params.pop("max_output_tokens", None)
         params.pop("temperature", None)
-        response = await self._request_backend(params)
+        response = await retry_provider_request(
+            "OpenAI OAuth",
+            lambda: self._request_backend(params),
+            max_attempts=request_max_retries,
+        )
         return await self._parse_responses_completion(response, tools)
 
     async def generate_image(

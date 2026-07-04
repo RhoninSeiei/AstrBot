@@ -203,6 +203,54 @@ async def test_request_backend_refreshes_once_after_401(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_accepts_request_max_retries_and_preserves_responses_payload():
+    requested_payloads: list[dict] = []
+    provider = _make_provider()
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {
+            "id": "resp_text",
+            "output_text": "pong",
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "total_tokens": 7,
+            },
+        }
+
+    provider._request_backend = fake_request_backend
+    try:
+        response = await provider._query(
+            {
+                "model": "gpt-5.4",
+                "messages": [
+                    {"role": "system", "content": "use concise replies"},
+                    {"role": "user", "content": "ping"},
+                ],
+            },
+            None,
+            request_max_retries=2,
+        )
+
+        assert response.completion_text == "pong"
+        payload = requested_payloads[0]
+        assert payload["model"] == "gpt-5.4"
+        assert payload["instructions"] == "use concise replies"
+        assert payload["input"] == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "ping",
+            }
+        ]
+        assert payload["stream"] is True
+        assert payload["store"] is False
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_generate_image_extracts_base64_result(tmp_path):
     image_bytes = b"\x89PNG\r\n\x1a\nsample"
     requested_payloads: list[dict] = []

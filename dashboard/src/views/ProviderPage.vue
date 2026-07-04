@@ -450,6 +450,7 @@
 </template>
 
 <script setup>
+import axios from 'axios'
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { providerApi } from '@/api/v1'
