@@ -43,7 +43,8 @@ def _make_provider(
     )
 
 
-def test_oauth_provider_keeps_access_token_out_of_key_pool():
+@pytest.mark.asyncio
+async def test_oauth_provider_keeps_access_token_out_of_key_pool():
     provider = _make_provider()
     try:
         assert provider.get_keys() == ["__openai_oauth__"]
@@ -51,8 +52,7 @@ def test_oauth_provider_keeps_access_token_out_of_key_pool():
         assert provider.provider_config["oauth_access_token"] == "test-token"
         assert provider.chosen_api_key == ""
     finally:
-        # AsyncOpenAI.close is async; this test does not perform network IO.
-        pass
+        await provider.terminate()
 
 
 def test_parse_codex_auth_json_tokens_object():
@@ -99,9 +99,7 @@ async def test_ensure_fresh_oauth_token_refreshes_and_persists(monkeypatch):
         return {
             "access_token": "new-access",
             "refresh_token": "new-refresh",
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "email": "new@example.com",
             "account_id": "new-account",
         }
@@ -147,9 +145,7 @@ async def test_request_backend_refreshes_once_after_401(monkeypatch):
         return {
             "access_token": "retried-access",
             "refresh_token": "retried-refresh",
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "email": "",
             "account_id": "retried-account",
         }
@@ -203,6 +199,324 @@ async def test_request_backend_refreshes_once_after_401(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_oauth_provider_exposes_codex_model_catalog_and_defaults():
+    provider = _make_provider()
+    try:
+        models = await provider.get_models()
+
+        assert models[:3] == [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ]
+        expected_efforts = ("none", "low", "medium", "high", "xhigh", "max")
+        for model in models[:3]:
+            assert (
+                provider.model_capabilities[model]["supported_reasoning_efforts"]
+                == expected_efforts
+            )
+        assert (
+            provider.model_capabilities["gpt-5.6-sol"]["default_reasoning_effort"]
+            == "low"
+        )
+        assert (
+            provider.model_capabilities["gpt-5.6-terra"]["default_reasoning_effort"]
+            == "medium"
+        )
+        assert (
+            provider.model_capabilities["gpt-5.6-luna"]["default_reasoning_effort"]
+            == "medium"
+        )
+        assert (
+            provider.model_capabilities["gpt-5.3-codex-spark"][
+                "default_reasoning_effort"
+            ]
+            == "high"
+        )
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_request_backend_sends_codex_identity_and_residency_headers(
+    monkeypatch,
+):
+    sent_requests: list[dict] = []
+    access_token = _jwt_with_claims(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "test-account",
+                "chatgpt_compute_residency": "us",
+            }
+        }
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aread(self):
+            return b'data: {"type":"response.completed","response":{"id":"ok"}}\n\n'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, *args, **kwargs):
+            sent_requests.append(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
+    provider = _make_provider({"oauth_access_token": access_token})
+    try:
+        await provider._request_backend_once({"model": "gpt-5.6-luna"})
+
+        headers = sent_requests[0]["headers"]
+        assert headers["version"] == "0.144.0"
+        assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
+        assert headers["x-openai-internal-codex-residency"] == "us"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claims", "expected_residency"),
+    [
+        (
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_data_residency": "eu",
+                    "chatgpt_compute_residency": "us",
+                },
+                "chatgpt_data_residency": "ca",
+            },
+            "eu",
+        ),
+        (
+            {
+                "https://api.openai.com/auth": {},
+                "chatgpt_compute_residency": "ca",
+            },
+            "ca",
+        ),
+        ({}, None),
+    ],
+)
+async def test_backend_headers_resolve_residency_claims(claims, expected_residency):
+    provider = _make_provider({"oauth_access_token": _jwt_with_claims(claims)})
+    try:
+        headers = provider._build_backend_headers()
+
+        if expected_residency is None:
+            assert "x-openai-internal-codex-residency" not in headers
+        else:
+            assert headers["x-openai-internal-codex-residency"] == expected_residency
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_backend_headers_allow_explicit_overrides_and_invalid_jwt():
+    provider = _make_provider(
+        {
+            "oauth_access_token": "not-a-jwt",
+            "custom_headers": {
+                "version": "custom-version",
+                "x-openai-internal-codex-residency": "manual",
+            },
+        }
+    )
+    try:
+        headers = provider._build_backend_headers()
+
+        assert headers["version"] == "custom-version"
+        assert headers["x-openai-internal-codex-residency"] == "manual"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "configured_effort", "expected_effort"),
+    [
+        ("gpt-5.6-luna", "max", "max"),
+        ("gpt-5.5", "max", "xhigh"),
+        ("gpt-5.6-terra", "off", "none"),
+    ],
+)
+async def test_query_normalizes_reasoning_effort_for_codex_responses(
+    model,
+    configured_effort,
+    expected_effort,
+):
+    requested_payloads: list[dict] = []
+    provider = _make_provider(
+        {
+            "model": model,
+            "custom_extra_body": {"reasoning_effort": configured_effort},
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        await provider._query(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            None,
+        )
+
+        payload = requested_payloads[0]
+        assert payload["reasoning"] == {"effort": expected_effort}
+        assert "reasoning_effort" not in payload
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("custom_extra_body", "request_kwargs", "model", "expected_reasoning"),
+    [
+        (
+            {"reasoning_effort": "low", "reasoning": {"effort": "medium"}},
+            {},
+            "gpt-5.6-sol",
+            {"effort": "medium"},
+        ),
+        (
+            {"reasoning": {"effort": "low", "summary": "auto"}},
+            {"reasoning_effort": "high"},
+            "gpt-5.6-sol",
+            {"effort": "high", "summary": "auto"},
+        ),
+        (
+            {"reasoning_effort": "medium"},
+            {"reasoning_effort": "experimental"},
+            "gpt-future-codex",
+            {"effort": "experimental"},
+        ),
+    ],
+)
+async def test_text_chat_reasoning_precedence_and_unknown_model_passthrough(
+    custom_extra_body,
+    request_kwargs,
+    model,
+    expected_reasoning,
+):
+    requested_payloads: list[dict] = []
+    provider = _make_provider(
+        {
+            "model": model,
+            "custom_extra_body": custom_extra_body,
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        await provider.text_chat(prompt="ping", **request_kwargs)
+
+        assert requested_payloads[0]["reasoning"] == expected_reasoning
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_rejects_invalid_effort_for_known_model():
+    backend_called = False
+    provider = _make_provider(
+        {
+            "model": "gpt-5.6-sol",
+            "custom_extra_body": {"reasoning_effort": "experimental"},
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        nonlocal backend_called
+        backend_called = True
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        with pytest.raises(ValueError, match="experimental"):
+            await provider.text_chat(prompt="ping")
+        assert backend_called is False
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_reasoning_kwargs_override_model_configuration():
+    requested_payloads: list[dict] = []
+    provider = _make_provider(
+        {
+            "model": "gpt-5.6-sol",
+            "custom_extra_body": {"reasoning_effort": "low"},
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        await provider.text_chat(
+            prompt="ping",
+            reasoning_effort="high",
+            reasoning={"effort": "max", "summary": "auto"},
+        )
+
+        assert requested_payloads[0]["reasoning"] == {
+            "effort": "max",
+            "summary": "auto",
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_rejects_ultra_as_single_provider_request():
+    backend_called = False
+    provider = _make_provider(
+        {
+            "model": "gpt-5.6-sol",
+            "custom_extra_body": {"reasoning_effort": "ultra"},
+        }
+    )
+
+    async def fake_request_backend(payload: dict):
+        nonlocal backend_called
+        backend_called = True
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        with pytest.raises(ValueError, match="ultra"):
+            await provider.text_chat(prompt="ping")
+        assert backend_called is False
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_query_accepts_request_max_retries_and_preserves_responses_payload():
     requested_payloads: list[dict] = []
     provider = _make_provider()
@@ -246,6 +560,8 @@ async def test_query_accepts_request_max_retries_and_preserves_responses_payload
         ]
         assert payload["stream"] is True
         assert payload["store"] is False
+        assert "reasoning" not in payload
+        assert "reasoning_effort" not in payload
     finally:
         await provider.terminate()
 
@@ -345,9 +661,7 @@ async def test_generate_image_with_reference_file_builds_image_edit_payload(tmp_
         )
 
         payload = requested_payloads[0]
-        assert (
-            payload["instructions"] == "keep the subject and change the background"
-        )
+        assert payload["instructions"] == "keep the subject and change the background"
         assert payload["stream"] is True
         assert payload["tools"] == [
             {
@@ -489,13 +803,30 @@ async def test_generate_image_reads_sse_incrementally(monkeypatch, tmp_path):
             return FakeStreamResponse()
 
     monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
-    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+    access_token = _jwt_with_claims(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_data_residency": "eu",
+            }
+        }
+    )
+    provider = _make_provider(
+        {
+            "generated_image_dir": str(tmp_path),
+            "oauth_access_token": access_token,
+        }
+    )
     try:
         results = await provider.generate_image("draw from streaming response")
 
         assert sent_requests[0]["method"] == "POST"
+        assert sent_requests[0]["headers"]["version"] == "0.144.0"
+        assert sent_requests[0]["headers"]["User-Agent"] == ("codex_cli_rs/0.144.0")
+        assert sent_requests[0]["headers"]["x-openai-internal-codex-residency"] == "eu"
         assert sent_requests[0]["json"]["stream"] is True
-        assert sent_requests[0]["json"]["instructions"] == "draw from streaming response"
+        assert (
+            sent_requests[0]["json"]["instructions"] == "draw from streaming response"
+        )
         assert sent_requests[0]["json"]["tools"] == [
             {
                 "type": "image_generation",

@@ -15,7 +15,10 @@ import httpx
 from astrbot import logger
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
-from astrbot.core.provider.oauth.openai_oauth import refresh_access_token
+from astrbot.core.provider.oauth.openai_oauth import (
+    decode_jwt_claims,
+    refresh_access_token,
+)
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ..register import register_provider_adapter
@@ -23,6 +26,7 @@ from .openai_source import ProviderOpenAIOfficial
 from .request_retry import retry_provider_request
 
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
+CODEX_CLIENT_VERSION = "0.144.0"
 
 
 @dataclass
@@ -46,6 +50,81 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         "reasoning": True,
         "image_generate": True,
         "image_edit": True,
+    }
+    model_capabilities = {
+        "gpt-5.6-sol": {
+            "default_reasoning_effort": "low",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
+        },
+        "gpt-5.6-terra": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
+        },
+        "gpt-5.6-luna": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
+        },
+        "gpt-5.5": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            ),
+        },
+        "gpt-5.4": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            ),
+        },
+        "gpt-5.4-mini": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            ),
+        },
+        "gpt-5.3-codex-spark": {
+            "default_reasoning_effort": "high",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            ),
+        },
     }
 
     def __init__(self, provider_config, provider_settings) -> None:
@@ -74,11 +153,30 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         )
 
     async def get_models(self):
-        logger.info(
-            "账号态 OAuth provider source %s 不支持自动拉取模型列表，将使用手动填写的模型 ID。",
-            self.provider_config.get("id", "unknown"),
+        return list(self.model_capabilities)
+
+    async def _prepare_chat_payload(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Preserve per-request reasoning controls for Codex Responses.
+
+        Args:
+            *args: Positional arguments forwarded to the OpenAI payload builder.
+            **kwargs: Keyword arguments forwarded to the OpenAI payload builder.
+
+        Returns:
+            The prepared request payload and normalized message context.
+        """
+        payloads, context_query = await super()._prepare_chat_payload(
+            *args,
+            **kwargs,
         )
-        return []
+        for key in ("reasoning_effort", "reasoning"):
+            if kwargs.get(key) is not None:
+                payloads[key] = kwargs[key]
+        return payloads, context_query
 
     def _parse_oauth_expires_at(self) -> datetime | None:
         value = (self.provider_config.get("oauth_expires_at") or "").strip()
@@ -111,14 +209,12 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         if refresh_token:
             self.provider_config["oauth_refresh_token"] = refresh_token
         self.provider_config["oauth_expires_at"] = str(token.get("expires_at") or "")
-        self.provider_config["oauth_account_email"] = (
-            str(token.get("email") or "")
-            or self.provider_config.get("oauth_account_email", "")
-        )
-        self.provider_config["oauth_account_id"] = (
-            str(token.get("account_id") or "")
-            or self.provider_config.get("oauth_account_id", "")
-        )
+        self.provider_config["oauth_account_email"] = str(
+            token.get("email") or ""
+        ) or self.provider_config.get("oauth_account_email", "")
+        self.provider_config["oauth_account_id"] = str(
+            token.get("account_id") or ""
+        ) or self.provider_config.get("oauth_account_id", "")
         self.account_id = self.provider_config.get("oauth_account_id", "")
         self.api_keys = [OAUTH_PLACEHOLDER_KEY]
         self.chosen_api_key = ""
@@ -148,9 +244,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 "oauth_account_email": self.provider_config.get(
                     "oauth_account_email", ""
                 ),
-                "oauth_account_id": self.provider_config.get(
-                    "oauth_account_id", ""
-                ),
+                "oauth_account_id": self.provider_config.get("oauth_account_id", ""),
             }
             result = persist_callback(patch)
             if inspect.isawaitable(result):
@@ -165,10 +259,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 return
             await self._refresh_oauth_token()
 
-    async def _request_backend_once(
-        self,
-        payload: dict[str, Any],
-    ) -> tuple[int, str]:
+    def _build_backend_headers(self) -> dict[str, str]:
         access_token = (self.provider_config.get("oauth_access_token") or "").strip()
         account_id = (
             self.provider_config.get("oauth_account_id") or self.account_id or ""
@@ -180,18 +271,45 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 "当前 OAuth Source 缺少 chatgpt_account_id，请重新绑定或导入完整 JSON 凭据"
             )
 
+        claims = decode_jwt_claims(access_token)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        residency = ""
+        if isinstance(auth_claims, dict):
+            residency = str(
+                auth_claims.get("chatgpt_data_residency")
+                or auth_claims.get("chatgpt_compute_residency")
+                or ""
+            ).strip()
+        if not residency:
+            residency = str(
+                claims.get("chatgpt_data_residency")
+                or claims.get("chatgpt_compute_residency")
+                or ""
+            ).strip()
+
         headers = {
             "Authorization": f"Bearer {access_token}",
             "chatgpt-account-id": account_id,
             "OpenAI-Beta": "responses=experimental",
             "originator": "codex_cli_rs",
+            "version": CODEX_CLIENT_VERSION,
+            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
+        if residency:
+            headers["x-openai-internal-codex-residency"] = residency
         custom_headers = self.provider_config.get("custom_headers")
         if isinstance(custom_headers, dict):
             for key, value in custom_headers.items():
                 headers[str(key)] = str(value)
+        return headers
+
+    async def _request_backend_once(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int, str]:
+        headers = self._build_backend_headers()
 
         async with httpx.AsyncClient(
             proxy=self.provider_config.get("proxy") or None,
@@ -225,29 +343,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         self,
         payload: dict[str, Any],
     ) -> tuple[int, str]:
-        access_token = (self.provider_config.get("oauth_access_token") or "").strip()
-        account_id = (
-            self.provider_config.get("oauth_account_id") or self.account_id or ""
-        ).strip()
-        if not access_token:
-            raise Exception("当前 OAuth Source 尚未绑定 access token")
-        if not account_id:
-            raise Exception(
-                "当前 OAuth Source 缺少 chatgpt_account_id，请重新绑定或导入完整 JSON 凭据"
-            )
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        custom_headers = self.provider_config.get("custom_headers")
-        if isinstance(custom_headers, dict):
-            for key, value in custom_headers.items():
-                headers[str(key)] = str(value)
+        headers = self._build_backend_headers()
 
         text_parts: list[str] = []
         async with httpx.AsyncClient(
@@ -711,6 +807,51 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 if key in {"model", "input", "instructions"}:
                     continue
                 params[key] = value
+
+        reasoning_value = params.get("reasoning")
+        if reasoning_value is not None and not isinstance(reasoning_value, dict):
+            raise ValueError("reasoning 必须是对象。")
+        reasoning = dict(reasoning_value or {})
+
+        configured_effort = params.pop("reasoning_effort", None)
+        if configured_effort is not None and "effort" not in reasoning:
+            reasoning["effort"] = configured_effort
+
+        request_effort = payloads.get("reasoning_effort")
+        if request_effort is not None:
+            reasoning["effort"] = request_effort
+        request_reasoning = payloads.get("reasoning")
+        if request_reasoning is not None:
+            if not isinstance(request_reasoning, dict):
+                raise ValueError("reasoning 必须是对象。")
+            reasoning.update(request_reasoning)
+
+        if "effort" in reasoning:
+            effort = str(reasoning["effort"] or "").strip().lower()
+            if effort == "off":
+                effort = "none"
+            if effort == "ultra":
+                raise ValueError(
+                    "reasoning_effort=ultra 需要多代理调度，不能作为单次 Provider 请求发送。"
+                )
+            model = str(params["model"] or "").strip().lower()
+            capability = self.model_capabilities.get(model)
+            if capability:
+                supported = capability["supported_reasoning_efforts"]
+                if effort == "max" and effort not in supported and "xhigh" in supported:
+                    effort = "xhigh"
+                elif effort not in supported:
+                    supported_text = ", ".join(supported)
+                    raise ValueError(
+                        f"模型 {model} 不支持 reasoning_effort={effort}；"
+                        f"可用值：{supported_text}。"
+                    )
+            reasoning["effort"] = effort
+
+        if reasoning:
+            params["reasoning"] = reasoning
+        else:
+            params.pop("reasoning", None)
         params.pop("max_output_tokens", None)
         params.pop("temperature", None)
         response = await retry_provider_request(
