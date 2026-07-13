@@ -12,6 +12,7 @@ from astrbot.core.utils.error_redaction import safe_error
 
 from ..persona_mgr import PersonaManager
 from .entities import ProviderType
+from .oauth.openai_oauth_shared_state import OpenAIOAuthSharedState
 from .provider import (
     EmbeddingProvider,
     Provider,
@@ -42,6 +43,7 @@ class ProviderManager:
         config = acm.confs["default"]
         self.providers_config: list = config["provider"]
         self.provider_sources_config: list = config.get("provider_sources", [])
+        self._openai_oauth_shared_states: dict[str, OpenAIOAuthSharedState] = {}
         self.provider_settings: dict = config["provider_settings"]
         self.provider_stt_settings: dict = config.get("provider_stt_settings", {})
         self.provider_tts_settings: dict = config.get("provider_tts_settings", {})
@@ -530,9 +532,59 @@ class ProviderManager:
             if updated_source is None:
                 raise ValueError(f"Provider source {provider_source_id} not found")
 
+            self.sync_openai_oauth_shared_state(provider_source_id, patch)
             self.provider_sources_config = provider_sources
             astrbot_config["provider_sources"] = provider_sources
             config.save_config()
+
+    def get_openai_oauth_shared_state(
+        self,
+        provider_source_id: str,
+        source_config: dict | None = None,
+    ) -> OpenAIOAuthSharedState:
+        state = self._openai_oauth_shared_states.get(provider_source_id)
+        if state is not None:
+            return state
+        if source_config is None:
+            source_config = next(
+                (
+                    source
+                    for source in self.provider_sources_config
+                    if source.get("id") == provider_source_id
+                ),
+                None,
+            )
+        if source_config is None:
+            raise ValueError(f"Provider source {provider_source_id} not found")
+        state = OpenAIOAuthSharedState(provider_source_id, source_config)
+        self._openai_oauth_shared_states[provider_source_id] = state
+        return state
+
+    def sync_openai_oauth_shared_state(
+        self,
+        provider_source_id: str,
+        patch: dict,
+    ) -> OpenAIOAuthSharedState:
+        state = self.get_openai_oauth_shared_state(provider_source_id, patch)
+        state.apply(patch)
+        return state
+
+    def replace_openai_oauth_shared_state(
+        self,
+        provider_source_id: str,
+        source_config: dict,
+    ) -> OpenAIOAuthSharedState:
+        state = self.get_openai_oauth_shared_state(
+            provider_source_id,
+            source_config,
+        )
+        state.replace(source_config)
+        return state
+
+    def drop_openai_oauth_shared_state(self, provider_source_id: str) -> None:
+        state = self._openai_oauth_shared_states.pop(provider_source_id, None)
+        if state is not None:
+            state.replace({})
 
     def get_merged_provider_config(
         self,
@@ -569,12 +621,45 @@ class ProviderManager:
                     "provider_type", merged_config.get("provider_type")
                 )
                 if (
-                    merged_config.get("provider") == "openai"
-                    and merged_config.get("type") == "openai_oauth_chat_completion"
-                    and merged_config.get("auth_mode") == "openai_oauth"
+                    provider_source.get("provider") == "openai"
+                    and provider_source.get("type")
+                    == "openai_oauth_chat_completion"
                 ):
-                    merged_config["key"] = ["__openai_oauth__"]
-                    if runtime:
+                    provider_only_fields = {
+                        "id",
+                        "provider_source_id",
+                        "model",
+                        "modalities",
+                        "custom_extra_body",
+                        "enable",
+                    }
+                    merged_config = {
+                        **provider_source,
+                        **{
+                            key: value
+                            for key, value in pc.items()
+                            if key in provider_only_fields
+                        },
+                    }
+                    merged_config["id"] = pc["id"]
+                    merged_config["type"] = provider_source.get("type")
+                    merged_config["provider"] = provider_source.get("provider")
+                    merged_config["provider_type"] = provider_source.get(
+                        "provider_type"
+                    )
+                    if provider_source.get("auth_mode") == "openai_oauth":
+                        merged_config["key"] = ["__openai_oauth__"]
+                    if (
+                        runtime
+                        and provider_source.get("auth_mode") == "openai_oauth"
+                    ):
+                        merged_config["oauth_shared_state"] = (
+                            self.get_openai_oauth_shared_state(
+                                provider_source_id,
+                                provider_source,
+                            )
+                        )
+
                         async def persist_callback(
                             patch: dict,
                             source_id: str = provider_source_id,

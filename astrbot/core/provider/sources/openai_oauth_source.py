@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import inspect
 import json
@@ -18,6 +17,9 @@ from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.oauth.openai_oauth import (
     decode_jwt_claims,
     refresh_access_token,
+)
+from astrbot.core.provider.oauth.openai_oauth_shared_state import (
+    OpenAIOAuthSharedState,
 )
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -129,9 +131,23 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
     def __init__(self, provider_config, provider_settings) -> None:
         patched_config = dict(provider_config)
+        patched_config.pop("oauth_shared_state", None)
         patched_config["key"] = [OAUTH_PLACEHOLDER_KEY]
         super().__init__(patched_config, provider_settings)
         self.provider_config = dict(provider_config)
+        shared_state = self.provider_config.pop("oauth_shared_state", None)
+        if isinstance(shared_state, OpenAIOAuthSharedState):
+            self._oauth_shared_state = shared_state
+        else:
+            source_id = str(
+                self.provider_config.get("provider_source_id")
+                or self.provider_config.get("id")
+                or "openai_oauth"
+            )
+            self._oauth_shared_state = OpenAIOAuthSharedState(
+                source_id,
+                self.provider_config,
+            )
         self.provider_config["key"] = [OAUTH_PLACEHOLDER_KEY]
         self.api_keys = [OAUTH_PLACEHOLDER_KEY]
         self.chosen_api_key = ""
@@ -144,13 +160,14 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             self.provider_config.get("api_base")
             or "https://chatgpt.com/backend-api/codex"
         ).rstrip("/")
-        self._oauth_refresh_lock = asyncio.Lock()
+        self._oauth_refresh_lock = self._oauth_shared_state.refresh_lock
         self._oauth_refresh_skew_seconds = int(
             self.provider_config.get("oauth_refresh_skew_seconds") or 300
         )
         self._oauth_persist_callback = self.provider_config.get(
             "oauth_persist_callback"
         )
+        self._sync_oauth_credentials_from_shared()
 
     async def get_models(self):
         return list(self.model_capabilities)
@@ -193,6 +210,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             return None
 
     def _oauth_expiring_soon(self) -> bool:
+        self._sync_oauth_credentials_from_shared()
         expires_at = self._parse_oauth_expires_at()
         if expires_at is None:
             return False
@@ -201,28 +219,40 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         )
         return expires_at <= refresh_at
 
-    def _apply_oauth_token_to_runtime(self, token: dict[str, Any]) -> None:
-        access_token = str(token.get("access_token") or "").strip()
-        refresh_token = str(token.get("refresh_token") or "").strip()
-        if access_token:
-            self.provider_config["oauth_access_token"] = access_token
-        if refresh_token:
-            self.provider_config["oauth_refresh_token"] = refresh_token
-        self.provider_config["oauth_expires_at"] = str(token.get("expires_at") or "")
-        self.provider_config["oauth_account_email"] = str(
-            token.get("email") or ""
-        ) or self.provider_config.get("oauth_account_email", "")
-        self.provider_config["oauth_account_id"] = str(
-            token.get("account_id") or ""
-        ) or self.provider_config.get("oauth_account_id", "")
-        self.account_id = self.provider_config.get("oauth_account_id", "")
+    def _sync_oauth_credentials_from_shared(self) -> None:
+        self.provider_config.update(self._oauth_shared_state.snapshot())
+        self.account_id = str(
+            self.provider_config.get("oauth_account_id")
+            or self.provider_config.get("account_id")
+            or ""
+        ).strip()
         self.api_keys = [OAUTH_PLACEHOLDER_KEY]
         self.chosen_api_key = ""
         self.client.api_key = OAUTH_PLACEHOLDER_KEY
 
+    def _apply_oauth_token_to_runtime(self, token: dict[str, Any]) -> None:
+        access_token = str(token.get("access_token") or "").strip()
+        refresh_token = str(token.get("refresh_token") or "").strip()
+        patch: dict[str, Any] = {}
+        if access_token:
+            patch["oauth_access_token"] = access_token
+        if refresh_token:
+            patch["oauth_refresh_token"] = refresh_token
+        patch["oauth_expires_at"] = str(token.get("expires_at") or "")
+        patch["oauth_account_email"] = str(
+            token.get("email") or ""
+        ) or self.provider_config.get("oauth_account_email", "")
+        patch["oauth_account_id"] = str(
+            token.get("account_id") or ""
+        ) or self.provider_config.get("oauth_account_id", "")
+        self._oauth_shared_state.apply(patch)
+        self._sync_oauth_credentials_from_shared()
+
     async def _refresh_oauth_token(self) -> bool:
-        refresh_token_value = (
-            self.provider_config.get("oauth_refresh_token") or ""
+        self._sync_oauth_credentials_from_shared()
+        refresh_version, credentials = self._oauth_shared_state.versioned_snapshot()
+        refresh_token_value = str(
+            credentials.get("oauth_refresh_token") or ""
         ).strip()
         if not refresh_token_value:
             return False
@@ -231,6 +261,9 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             refresh_token_value,
             self.provider_config.get("proxy", ""),
         )
+        if self._oauth_shared_state.version != refresh_version:
+            self._sync_oauth_credentials_from_shared()
+            return True
         self._apply_oauth_token_to_runtime(token)
 
         persist_callback = self._oauth_persist_callback
@@ -252,17 +285,34 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         return True
 
     async def _ensure_fresh_oauth_token(self) -> None:
+        self._sync_oauth_credentials_from_shared()
         if not self._oauth_expiring_soon():
             return
         async with self._oauth_refresh_lock:
+            self._sync_oauth_credentials_from_shared()
             if not self._oauth_expiring_soon():
                 return
             await self._refresh_oauth_token()
 
+    async def _refresh_after_auth_failure(self, attempted_version: int) -> bool:
+        async with self._oauth_refresh_lock:
+            self._sync_oauth_credentials_from_shared()
+            if self._oauth_shared_state.version != attempted_version:
+                return True
+            return await self._refresh_oauth_token()
+
     def _build_backend_headers(self) -> dict[str, str]:
-        access_token = (self.provider_config.get("oauth_access_token") or "").strip()
+        headers, _version = self._build_backend_headers_with_version()
+        return headers
+
+    def _build_backend_headers_with_version(self) -> tuple[dict[str, str], int]:
+        attempted_version, credentials = (
+            self._oauth_shared_state.versioned_snapshot()
+        )
+        self.provider_config.update(credentials)
+        access_token = str(credentials.get("oauth_access_token") or "").strip()
         account_id = (
-            self.provider_config.get("oauth_account_id") or self.account_id or ""
+            str(credentials.get("oauth_account_id") or "") or self.account_id
         ).strip()
         if not access_token:
             raise Exception("当前 OAuth Source 尚未绑定 access token")
@@ -303,13 +353,13 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         if isinstance(custom_headers, dict):
             for key, value in custom_headers.items():
                 headers[str(key)] = str(value)
-        return headers
+        return headers, attempted_version
 
     async def _request_backend_once(
         self,
         payload: dict[str, Any],
-    ) -> tuple[int, str]:
-        headers = self._build_backend_headers()
+    ) -> tuple[int, str, int]:
+        headers, attempted_version = self._build_backend_headers_with_version()
 
         async with httpx.AsyncClient(
             proxy=self.provider_config.get("proxy") or None,
@@ -323,17 +373,20 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             )
             raw_text = await response.aread()
         text = raw_text.decode("utf-8", errors="replace")
-        return response.status_code, text
+        return response.status_code, text, attempted_version
 
     async def _request_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_fresh_oauth_token()
-        status_code, text = await self._request_backend_once(payload)
+        status_code, text, attempted_version = await self._request_backend_once(
+            payload
+        )
 
         if status_code in {401, 403}:
-            async with self._oauth_refresh_lock:
-                refreshed = await self._refresh_oauth_token()
+            refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
-                status_code, text = await self._request_backend_once(payload)
+                status_code, text, _attempted_version = (
+                    await self._request_backend_once(payload)
+                )
 
         if status_code < 200 or status_code >= 300:
             raise Exception(self._format_backend_error(status_code, text))
@@ -342,8 +395,8 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
     async def _request_image_backend_once(
         self,
         payload: dict[str, Any],
-    ) -> tuple[int, str]:
-        headers = self._build_backend_headers()
+    ) -> tuple[int, str, int]:
+        headers, attempted_version = self._build_backend_headers_with_version()
 
         text_parts: list[str] = []
         async with httpx.AsyncClient(
@@ -381,17 +434,20 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                     }:
                         break
 
-        return response.status_code, "\n".join(text_parts)
+        return response.status_code, "\n".join(text_parts), attempted_version
 
     async def _request_image_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_fresh_oauth_token()
-        status_code, text = await self._request_image_backend_once(payload)
+        status_code, text, attempted_version = (
+            await self._request_image_backend_once(payload)
+        )
 
         if status_code in {401, 403}:
-            async with self._oauth_refresh_lock:
-                refreshed = await self._refresh_oauth_token()
+            refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
-                status_code, text = await self._request_image_backend_once(payload)
+                status_code, text, _attempted_version = (
+                    await self._request_image_backend_once(payload)
+                )
 
         if status_code < 200 or status_code >= 300:
             raise Exception(self._format_backend_error(status_code, text))

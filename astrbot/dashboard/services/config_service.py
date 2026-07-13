@@ -6,6 +6,8 @@ import inspect
 import os
 import time
 import traceback
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -1325,6 +1327,18 @@ class ProviderConfigService:
         return {"provider_source": copy.deepcopy(source)}
 
     async def upsert_provider_source(self, source_id: str, config: dict) -> None:
+        current_source = self._find_provider_source(source_id)
+        async with self._openai_oauth_runtime_source_guard(
+            source_id,
+            current_source,
+        ):
+            await self._upsert_provider_source_unlocked(source_id, config)
+
+    async def _upsert_provider_source_unlocked(
+        self,
+        source_id: str,
+        config: dict,
+    ) -> None:
         config = copy.deepcopy(config)
         next_source_id = str(config.get("id") or source_id).strip()
         if not next_source_id:
@@ -1348,14 +1362,26 @@ class ProviderConfigService:
                 )
                 save_config(self.config, self.config, is_core=True)
                 self.provider_manager.provider_sources_config = sources
+                self._replace_openai_oauth_runtime_source(next_source_id, config)
+                if old_source_id != next_source_id:
+                    self._drop_openai_oauth_runtime_source(old_source_id)
                 await self._reload_providers(affected_providers)
                 return
 
         sources.append(config)
         save_config(self.config, self.config, is_core=True)
         self.provider_manager.provider_sources_config = sources
+        self._replace_openai_oauth_runtime_source(next_source_id, config)
 
     async def delete_provider_source(self, source_id: str) -> None:
+        provider_source = self._require_provider_source(source_id)
+        async with self._openai_oauth_runtime_source_guard(
+            source_id,
+            provider_source,
+        ):
+            await self._delete_provider_source_unlocked(source_id)
+
+    async def _delete_provider_source_unlocked(self, source_id: str) -> None:
         sources = self.config.get("provider_sources", [])
         next_sources = [source for source in sources if source.get("id") != source_id]
         if len(next_sources) == len(sources):
@@ -1364,6 +1390,7 @@ class ProviderConfigService:
         await self.provider_manager.delete_provider(provider_source_id=source_id)
         save_config(self.config, self.config, is_core=True)
         self.provider_manager.provider_sources_config = next_sources
+        self._drop_openai_oauth_runtime_source(source_id)
 
     def _require_provider_source(self, source_id: str) -> dict:
         source = self._find_provider_source(source_id)
@@ -1376,6 +1403,81 @@ class ProviderConfigService:
             provider_source.get("provider") == "openai"
             and provider_source.get("type") == "openai_oauth_chat_completion"
         )
+
+    def _get_openai_oauth_runtime_source_state(
+        self,
+        source_id: str,
+        source_config: dict | None,
+    ) -> Any | None:
+        if not isinstance(source_config, dict):
+            return None
+        if not self._is_openai_oauth_supported_source(source_config):
+            return None
+        get_state = getattr(
+            self.provider_manager,
+            "get_openai_oauth_shared_state",
+            None,
+        )
+        if not callable(get_state):
+            return None
+        return get_state(source_id, source_config)
+
+    @asynccontextmanager
+    async def _openai_oauth_runtime_source_guard(
+        self,
+        source_id: str,
+        source_config: dict | None,
+    ) -> AsyncIterator[Any | None]:
+        shared_state = self._get_openai_oauth_runtime_source_state(
+            source_id,
+            source_config,
+        )
+        if shared_state is None:
+            yield None
+            return
+        async with shared_state.refresh_lock:
+            yield shared_state
+
+    def _sync_openai_oauth_runtime_source(
+        self,
+        source_id: str,
+        source_config: dict,
+    ) -> None:
+        if not self._is_openai_oauth_supported_source(source_config):
+            return
+        sync_state = getattr(
+            self.provider_manager,
+            "sync_openai_oauth_shared_state",
+            None,
+        )
+        if callable(sync_state):
+            sync_state(source_id, source_config)
+
+    def _replace_openai_oauth_runtime_source(
+        self,
+        source_id: str,
+        source_config: dict,
+    ) -> None:
+        replace_state = getattr(
+            self.provider_manager,
+            "replace_openai_oauth_shared_state",
+            None,
+        )
+        if callable(replace_state):
+            replace_state(source_id, source_config)
+        elif self._is_openai_oauth_supported_source(source_config):
+            self._sync_openai_oauth_runtime_source(source_id, source_config)
+        if not self._is_openai_oauth_supported_source(source_config):
+            self._drop_openai_oauth_runtime_source(source_id)
+
+    def _drop_openai_oauth_runtime_source(self, source_id: str) -> None:
+        drop_state = getattr(
+            self.provider_manager,
+            "drop_openai_oauth_shared_state",
+            None,
+        )
+        if callable(drop_state):
+            drop_state(source_id)
 
     def _cleanup_expired_provider_source_oauth_flows(self) -> None:
         now = time.time()
@@ -1411,6 +1513,7 @@ class ProviderConfigService:
             raise ValueError(f"Provider source {source_id} not found")
 
         self.config["provider_sources"] = sources
+        self._sync_openai_oauth_runtime_source(source_id, sources[idx])
         save_config(self.config, self.config, is_core=True)
         self.provider_manager.provider_sources_config = sources
         await self._reload_providers_for_source(source_id)
@@ -1459,41 +1562,45 @@ class ProviderConfigService:
         if not self._is_openai_oauth_supported_source(provider_source):
             raise ValueError("Provider source does not support OpenAI OAuth")
         try:
-            token = parse_oauth_credential_json(auth_input)
-            if token is None:
-                if not flow:
-                    raise ValueError("OAuth flow has not started or has expired")
-                code, state = parse_authorization_input(auth_input)
-                if not code:
-                    raise ValueError("Missing authorization code")
-                if not state:
-                    raise ValueError("Missing state")
-                if state != flow.get("state"):
-                    raise ValueError("OAuth state mismatch")
-                token = await exchange_authorization_code(
-                    code,
-                    flow.get("verifier", ""),
-                    provider_source.get("proxy", ""),
-                )
-
-            updated_source = await self._persist_provider_source_patch(
+            async with self._openai_oauth_runtime_source_guard(
                 source_id,
-                {
-                    "auth_mode": "openai_oauth",
-                    "oauth_provider": "openai",
-                    "oauth_access_token": token["access_token"],
-                    "oauth_refresh_token": token["refresh_token"],
-                    "oauth_expires_at": token["expires_at"],
-                    "oauth_account_email": token.get("email", ""),
-                    "oauth_account_id": token.get("account_id", ""),
-                },
-            )
-            self._provider_source_oauth_flows.pop(source_id, None)
-            return {
-                "source": updated_source,
-                "email": updated_source.get("oauth_account_email", ""),
-                "expires_at": updated_source.get("oauth_expires_at", ""),
-            }
+                provider_source,
+            ):
+                token = parse_oauth_credential_json(auth_input)
+                if token is None:
+                    if not flow:
+                        raise ValueError("OAuth flow has not started or has expired")
+                    code, state = parse_authorization_input(auth_input)
+                    if not code:
+                        raise ValueError("Missing authorization code")
+                    if not state:
+                        raise ValueError("Missing state")
+                    if state != flow.get("state"):
+                        raise ValueError("OAuth state mismatch")
+                    token = await exchange_authorization_code(
+                        code,
+                        flow.get("verifier", ""),
+                        provider_source.get("proxy", ""),
+                    )
+
+                updated_source = await self._persist_provider_source_patch(
+                    source_id,
+                    {
+                        "auth_mode": "openai_oauth",
+                        "oauth_provider": "openai",
+                        "oauth_access_token": token["access_token"],
+                        "oauth_refresh_token": token["refresh_token"],
+                        "oauth_expires_at": token["expires_at"],
+                        "oauth_account_email": token.get("email", ""),
+                        "oauth_account_id": token.get("account_id", ""),
+                    },
+                )
+                self._provider_source_oauth_flows.pop(source_id, None)
+                return {
+                    "source": updated_source,
+                    "email": updated_source.get("oauth_account_email", ""),
+                    "expires_at": updated_source.get("oauth_expires_at", ""),
+                }
         except Exception:
             logger.error(traceback.format_exc())
             raise
@@ -1504,13 +1611,11 @@ class ProviderConfigService:
             raise ValueError("Missing source_id")
 
         provider_source = self._require_provider_source(source_id)
-        refresh_token_value = (
-            provider_source.get("oauth_refresh_token") or ""
-        ).strip()
-        if not refresh_token_value:
-            raise ValueError("Provider source has no refresh token")
 
-        try:
+        async def refresh_and_persist(
+            refresh_token_value: str,
+            current_credentials: dict,
+        ) -> dict:
             token = await refresh_access_token(
                 refresh_token_value,
                 provider_source.get("proxy", ""),
@@ -1524,9 +1629,9 @@ class ProviderConfigService:
                     "oauth_refresh_token": token["refresh_token"],
                     "oauth_expires_at": token["expires_at"],
                     "oauth_account_email": token.get("email")
-                    or provider_source.get("oauth_account_email", ""),
+                    or current_credentials.get("oauth_account_email", ""),
                     "oauth_account_id": token.get("account_id")
-                    or provider_source.get("oauth_account_id", ""),
+                    or current_credentials.get("oauth_account_id", ""),
                 },
             )
             return {
@@ -1534,6 +1639,26 @@ class ProviderConfigService:
                 "email": updated_source.get("oauth_account_email", ""),
                 "expires_at": updated_source.get("oauth_expires_at", ""),
             }
+
+        try:
+            async with self._openai_oauth_runtime_source_guard(
+                source_id,
+                provider_source,
+            ) as shared_state:
+                current_credentials = (
+                    shared_state.snapshot()
+                    if shared_state is not None
+                    else provider_source
+                )
+                refresh_token_value = str(
+                    current_credentials.get("oauth_refresh_token") or ""
+                ).strip()
+                if not refresh_token_value:
+                    raise ValueError("Provider source has no refresh token")
+                return await refresh_and_persist(
+                    refresh_token_value,
+                    current_credentials,
+                )
         except Exception:
             logger.error(traceback.format_exc())
             raise
@@ -1543,20 +1668,25 @@ class ProviderConfigService:
         if not source_id:
             raise ValueError("Missing source_id")
 
-        updated_source = await self._persist_provider_source_patch(
+        provider_source = self._require_provider_source(source_id)
+        async with self._openai_oauth_runtime_source_guard(
             source_id,
-            {
-                "auth_mode": "manual",
-                "oauth_provider": "",
-                "oauth_access_token": "",
-                "oauth_refresh_token": "",
-                "oauth_expires_at": "",
-                "oauth_account_email": "",
-                "oauth_account_id": "",
-            },
-        )
-        self._provider_source_oauth_flows.pop(source_id, None)
-        return {"source": updated_source}
+            provider_source,
+        ):
+            updated_source = await self._persist_provider_source_patch(
+                source_id,
+                {
+                    "auth_mode": "manual",
+                    "oauth_provider": "",
+                    "oauth_access_token": "",
+                    "oauth_refresh_token": "",
+                    "oauth_expires_at": "",
+                    "oauth_account_email": "",
+                    "oauth_account_id": "",
+                },
+            )
+            self._provider_source_oauth_flows.pop(source_id, None)
+            return {"source": updated_source}
 
     async def upsert_provider_source_from_dashboard_payload(
         self, payload: object

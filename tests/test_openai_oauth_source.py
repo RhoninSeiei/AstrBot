@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from datetime import datetime, timedelta, timezone
@@ -6,7 +7,11 @@ from pathlib import Path
 import pytest
 
 import astrbot.core.provider.sources.openai_oauth_source as oauth_source
+from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
+from astrbot.core.provider.oauth.openai_oauth_shared_state import (
+    OpenAIOAuthSharedState,
+)
 from astrbot.core.provider.sources.openai_oauth_source import ProviderOpenAIOAuth
 
 
@@ -24,6 +29,7 @@ def _make_provider(
     overrides: dict | None = None,
     *,
     persist_callback=None,
+    shared_state: OpenAIOAuthSharedState | None = None,
 ) -> ProviderOpenAIOAuth:
     provider_config = {
         "id": "test-openai-oauth",
@@ -37,10 +43,142 @@ def _make_provider(
         provider_config.update(overrides)
     if persist_callback is not None:
         provider_config["oauth_persist_callback"] = persist_callback
+    if shared_state is not None:
+        provider_config["oauth_shared_state"] = shared_state
     return ProviderOpenAIOAuth(
         provider_config=provider_config,
         provider_settings={},
     )
+
+
+def _make_provider_manager_for_oauth_source() -> ProviderManager:
+    manager = ProviderManager.__new__(ProviderManager)
+    manager.provider_sources_config = [
+        {
+            "id": "openai_oauth",
+            "type": "openai_oauth_chat_completion",
+            "provider": "openai",
+            "provider_type": "chat_completion",
+            "auth_mode": "openai_oauth",
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "proxy": "http://source-proxy.local",
+            "oauth_access_token": "source-access",
+            "oauth_refresh_token": "source-refresh",
+            "oauth_expires_at": "2026-07-22T16:58:10+00:00",
+            "oauth_account_id": "source-account",
+        }
+    ]
+    manager._openai_oauth_shared_states = {}
+    return manager
+
+
+def test_runtime_configs_share_source_oauth_state_and_credentials():
+    manager = _make_provider_manager_for_oauth_source()
+    stale_model_fields = {
+        "provider_source_id": "openai_oauth",
+        "type": "openai_oauth_chat_completion",
+        "provider": "openai",
+        "provider_type": "chat_completion",
+        "enable": True,
+        "auth_mode": "manual",
+        "api_base": "https://wrong.example/v1",
+        "proxy": "http://wrong-proxy.local",
+        "oauth_access_token": "stale-access",
+        "oauth_refresh_token": "stale-refresh",
+    }
+
+    sol = manager.get_merged_provider_config(
+        {**stale_model_fields, "id": "openai_oauth/gpt-5.6-sol", "model": "gpt-5.6-sol"},
+        runtime=True,
+    )
+    terra = manager.get_merged_provider_config(
+        {
+            **stale_model_fields,
+            "id": "openai_oauth/gpt-5.6-terra",
+            "model": "gpt-5.6-terra",
+        },
+        runtime=True,
+    )
+
+    assert sol["oauth_shared_state"] is terra["oauth_shared_state"]
+    assert sol["api_base"] == "https://chatgpt.com/backend-api/codex"
+    assert sol["proxy"] == "http://source-proxy.local"
+    assert sol["oauth_access_token"] == "source-access"
+    assert sol["oauth_refresh_token"] == "source-refresh"
+
+
+def test_manual_source_cannot_be_overridden_by_stale_model_oauth_fields():
+    manager = _make_provider_manager_for_oauth_source()
+    manager.provider_sources_config[0].update(
+        {
+            "auth_mode": "manual",
+            "oauth_access_token": "",
+            "oauth_refresh_token": "",
+            "oauth_expires_at": "",
+            "oauth_account_id": "",
+        }
+    )
+
+    merged = manager.get_merged_provider_config(
+        {
+            "id": "openai_oauth/gpt-5.6-sol",
+            "provider_source_id": "openai_oauth",
+            "model": "gpt-5.6-sol",
+            "enable": True,
+            "auth_mode": "openai_oauth",
+            "oauth_access_token": "stale-access",
+            "oauth_refresh_token": "stale-refresh",
+            "oauth_account_id": "stale-account",
+        },
+        runtime=True,
+    )
+
+    assert merged["auth_mode"] == "manual"
+    assert merged["oauth_access_token"] == ""
+    assert merged["oauth_refresh_token"] == ""
+    assert merged["oauth_account_id"] == ""
+    assert "oauth_shared_state" not in merged
+
+
+def test_replacing_shared_oauth_source_clears_removed_credentials():
+    manager = _make_provider_manager_for_oauth_source()
+    state = manager.get_openai_oauth_shared_state(
+        "openai_oauth",
+        manager.provider_sources_config[0],
+    )
+
+    manager.replace_openai_oauth_shared_state(
+        "openai_oauth",
+        {
+            "id": "openai_oauth",
+            "type": "openai_chat_completion",
+            "provider": "openai",
+            "provider_type": "chat_completion",
+            "auth_mode": "manual",
+        },
+    )
+
+    snapshot = state.snapshot()
+    assert snapshot["auth_mode"] == "manual"
+    assert snapshot["oauth_access_token"] == ""
+    assert snapshot["oauth_refresh_token"] == ""
+    assert snapshot["oauth_expires_at"] == ""
+    assert snapshot["oauth_account_id"] == ""
+
+
+def test_dropping_shared_oauth_source_clears_cached_state():
+    manager = _make_provider_manager_for_oauth_source()
+    state = manager.get_openai_oauth_shared_state(
+        "openai_oauth",
+        manager.provider_sources_config[0],
+    )
+
+    manager.drop_openai_oauth_shared_state("openai_oauth")
+
+    snapshot = state.snapshot()
+    assert snapshot["oauth_access_token"] == ""
+    assert snapshot["oauth_refresh_token"] == ""
+    assert snapshot["oauth_account_id"] == ""
 
 
 @pytest.mark.asyncio
@@ -134,6 +272,253 @@ async def test_ensure_fresh_oauth_token_refreshes_and_persists(monkeypatch):
         ]
     finally:
         await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_shared_oauth_state_refreshes_once_across_provider_instances(
+    monkeypatch,
+):
+    expires_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    shared_state = OpenAIOAuthSharedState(
+        "openai_oauth",
+        {
+            "oauth_access_token": "expired-access",
+            "oauth_refresh_token": "shared-refresh",
+            "oauth_expires_at": expires_at,
+            "oauth_account_id": "shared-account",
+        },
+    )
+    calls = {"refresh": 0}
+
+    async def fake_refresh(refresh_token: str, proxy_url: str = ""):
+        calls["refresh"] += 1
+        assert refresh_token == "shared-refresh"
+        await asyncio.sleep(0.05)
+        return {
+            "access_token": "shared-new-access",
+            "refresh_token": "shared-new-refresh",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "email": "shared@example.com",
+            "account_id": "shared-account",
+        }
+
+    monkeypatch.setattr(oauth_source, "refresh_access_token", fake_refresh)
+    sol = _make_provider(
+        {"id": "openai_oauth/gpt-5.6-sol", "oauth_expires_at": expires_at},
+        shared_state=shared_state,
+    )
+    terra = _make_provider(
+        {"id": "openai_oauth/gpt-5.6-terra", "oauth_expires_at": expires_at},
+        shared_state=shared_state,
+    )
+    try:
+        await asyncio.gather(
+            sol._ensure_fresh_oauth_token(),
+            terra._ensure_fresh_oauth_token(),
+        )
+
+        assert calls["refresh"] == 1
+        assert sol.provider_config["oauth_access_token"] == "shared-new-access"
+        assert terra.provider_config["oauth_access_token"] == "shared-new-access"
+        assert terra.provider_config["oauth_refresh_token"] == "shared-new-refresh"
+    finally:
+        await sol.terminate()
+        await terra.terminate()
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_overwrite_newer_source_credentials(monkeypatch):
+    expires_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    shared_state = OpenAIOAuthSharedState(
+        "openai_oauth",
+        {
+            "oauth_access_token": "expired-access",
+            "oauth_refresh_token": "old-refresh",
+            "oauth_expires_at": expires_at,
+            "oauth_account_id": "shared-account",
+        },
+    )
+    refresh_started = asyncio.Event()
+    finish_refresh = asyncio.Event()
+    persisted = []
+
+    async def fake_refresh(refresh_token: str, proxy_url: str = ""):
+        assert refresh_token == "old-refresh"
+        refresh_started.set()
+        await finish_refresh.wait()
+        return {
+            "access_token": "stale-refreshed-access",
+            "refresh_token": "stale-refreshed-token",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "email": "stale@example.com",
+            "account_id": "shared-account",
+        }
+
+    async def persist_callback(patch: dict):
+        persisted.append(patch)
+
+    monkeypatch.setattr(oauth_source, "refresh_access_token", fake_refresh)
+    provider = _make_provider(
+        {"oauth_expires_at": expires_at},
+        persist_callback=persist_callback,
+        shared_state=shared_state,
+    )
+    try:
+        refresh_task = asyncio.create_task(provider._ensure_fresh_oauth_token())
+        await refresh_started.wait()
+        shared_state.replace(
+            {
+                "auth_mode": "openai_oauth",
+                "oauth_provider": "openai",
+                "oauth_access_token": "imported-access",
+                "oauth_refresh_token": "imported-refresh",
+                "oauth_expires_at": (
+                    datetime.now(timezone.utc) + timedelta(hours=2)
+                ).isoformat(),
+                "oauth_account_id": "shared-account",
+            }
+        )
+        finish_refresh.set()
+        await refresh_task
+
+        snapshot = shared_state.snapshot()
+        assert snapshot["oauth_access_token"] == "imported-access"
+        assert snapshot["oauth_refresh_token"] == "imported-refresh"
+        assert persisted == []
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_shared_oauth_state_updates_headers_for_other_models():
+    shared_state = OpenAIOAuthSharedState(
+        "openai_oauth",
+        {
+            "oauth_access_token": "old-access",
+            "oauth_refresh_token": "old-refresh",
+            "oauth_expires_at": "2026-07-22T16:58:10+00:00",
+            "oauth_account_id": "shared-account",
+        },
+    )
+    sol = _make_provider(shared_state=shared_state)
+    terra = _make_provider(
+        {"id": "openai_oauth/gpt-5.6-terra"},
+        shared_state=shared_state,
+    )
+    try:
+        sol._apply_oauth_token_to_runtime(
+            {
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_at": "2026-07-22T17:58:10+00:00",
+                "email": "shared@example.com",
+                "account_id": "shared-account",
+            }
+        )
+
+        headers = terra._build_backend_headers()
+
+        assert headers["Authorization"] == "Bearer new-access"
+        assert terra.provider_config["oauth_refresh_token"] == "new-refresh"
+    finally:
+        await sol.terminate()
+        await terra.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_method", "request_once_method"),
+    [
+        ("_request_backend", "_request_backend_once"),
+        ("_request_image_backend", "_request_image_backend_once"),
+    ],
+)
+async def test_shared_oauth_state_refreshes_once_after_concurrent_401(
+    monkeypatch,
+    request_method: str,
+    request_once_method: str,
+):
+    shared_state = OpenAIOAuthSharedState(
+        "openai_oauth",
+        {
+            "oauth_access_token": "rejected-access",
+            "oauth_refresh_token": "shared-refresh",
+            "oauth_expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "oauth_account_id": "shared-account",
+        },
+    )
+    refresh_calls = 0
+    first_attempts = 0
+    first_attempts_ready = asyncio.Event()
+
+    async def fake_refresh(refresh_token: str, proxy_url: str = ""):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        assert refresh_token == "shared-refresh"
+        return {
+            "access_token": "accepted-access",
+            "refresh_token": "rotated-refresh",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "email": "shared@example.com",
+            "account_id": "shared-account",
+        }
+
+    def make_backend():
+        attempts = 0
+
+        async def request_backend(payload: dict):
+            nonlocal attempts, first_attempts
+            attempts += 1
+            attempted_version = shared_state.version
+            if attempts == 1:
+                first_attempts += 1
+                if first_attempts == 2:
+                    first_attempts_ready.set()
+                await first_attempts_ready.wait()
+                return 401, '{"error":{"message":"expired"}}', attempted_version
+            return (
+                200,
+                'data: {"type":"response.completed","response":'
+                '{"id":"resp_ok","output_text":"OK","output":[]}}\n\n',
+                attempted_version,
+            )
+
+        return request_backend
+
+    monkeypatch.setattr(oauth_source, "refresh_access_token", fake_refresh)
+    sol = _make_provider(
+        {"id": "openai_oauth/gpt-5.6-sol"},
+        shared_state=shared_state,
+    )
+    terra = _make_provider(
+        {"id": "openai_oauth/gpt-5.6-terra"},
+        shared_state=shared_state,
+    )
+    monkeypatch.setattr(sol, request_once_method, make_backend())
+    monkeypatch.setattr(terra, request_once_method, make_backend())
+    try:
+        sol_response, terra_response = await asyncio.gather(
+            getattr(sol, request_method)({"model": "gpt-5.6-sol", "input": []}),
+            getattr(terra, request_method)(
+                {"model": "gpt-5.6-terra", "input": []}
+            ),
+        )
+
+        assert refresh_calls == 1
+        assert sol_response["id"] == "resp_ok"
+        assert terra_response["id"] == "resp_ok"
+        assert terra.provider_config["oauth_refresh_token"] == "rotated-refresh"
+    finally:
+        await sol.terminate()
+        await terra.terminate()
 
 
 @pytest.mark.asyncio
@@ -277,12 +662,73 @@ async def test_request_backend_sends_codex_identity_and_residency_headers(
     monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
     provider = _make_provider({"oauth_access_token": access_token})
     try:
-        await provider._request_backend_once({"model": "gpt-5.6-luna"})
+        status_code, _text, attempted_version = await provider._request_backend_once(
+            {"model": "gpt-5.6-luna"}
+        )
 
         headers = sent_requests[0]["headers"]
+        assert status_code == 200
+        assert attempted_version == provider._oauth_shared_state.version
         assert headers["version"] == "0.144.0"
         assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
         assert headers["x-openai-internal-codex-residency"] == "us"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_request_backend_reports_version_used_by_authorization_header(monkeypatch):
+    sent_requests: list[dict] = []
+    shared_state = OpenAIOAuthSharedState(
+        "openai_oauth",
+        {
+            "oauth_access_token": "header-access",
+            "oauth_refresh_token": "header-refresh",
+            "oauth_expires_at": "2026-07-22T16:58:10+00:00",
+            "oauth_account_id": "shared-account",
+        },
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aread(self):
+            return b'data: {"type":"response.completed","response":{"id":"ok"}}\n\n'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            pass
+
+        async def post(self, *args, **kwargs):
+            sent_requests.append(kwargs)
+            shared_state.replace(
+                {
+                    "oauth_access_token": "newer-access",
+                    "oauth_refresh_token": "newer-refresh",
+                    "oauth_expires_at": "2026-07-22T17:58:10+00:00",
+                    "oauth_account_id": "shared-account",
+                }
+            )
+            return FakeResponse()
+
+    monkeypatch.setattr(oauth_source.httpx, "AsyncClient", FakeClient)
+    provider = _make_provider(shared_state=shared_state)
+    try:
+        _status_code, _text, attempted_version = await provider._request_backend_once(
+            {"model": "gpt-5.6-sol"}
+        )
+
+        assert sent_requests[0]["headers"]["Authorization"] == "Bearer header-access"
+        assert attempted_version < shared_state.version
     finally:
         await provider.terminate()
 
