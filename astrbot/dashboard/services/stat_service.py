@@ -285,7 +285,7 @@ class StatService:
                 result = await session.execute(
                     select(ProviderStat)
                     .where(
-                        ProviderStat.agent_type == "internal",
+                        col(ProviderStat.agent_type).in_(("internal", "provider")),
                         ProviderStat.created_at >= query_start_utc,
                     )
                     .order_by(col(ProviderStat.created_at).asc())
