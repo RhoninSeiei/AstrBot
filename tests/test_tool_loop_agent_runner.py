@@ -11,6 +11,7 @@ import pytest
 # 将项目根目录添加到 sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import astrbot.core.provider.provider as provider_module
 from astrbot.core.agent.agent import Agent
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.hooks import BaseAgentRunHooks
@@ -80,6 +81,29 @@ class MockProvider(Provider):
         yield response
         response.is_chunk = False
         yield response
+
+
+class ProviderStatsContextProbe(MockProvider):
+    def __init__(self, *, fail: bool = False):
+        super().__init__()
+        self.fail = fail
+        self.observed_values: list[bool] = []
+
+    async def text_chat(self, **kwargs) -> LLMResponse:
+        self.observed_values.append(
+            provider_module.provider_stats_managed_by_agent.get()
+        )
+        if self.fail:
+            raise RuntimeError("provider call failed")
+        return LLMResponse(role="assistant", completion_text="done")
+
+    async def text_chat_stream(self, **kwargs):
+        self.observed_values.append(
+            provider_module.provider_stats_managed_by_agent.get()
+        )
+        if self.fail:
+            raise RuntimeError("provider call failed")
+        yield LLMResponse(role="assistant", completion_text="done")
 
 
 class MockToolExecutor:
@@ -436,6 +460,64 @@ def runner():
 
 def _make_large_tool_result_text() -> str:
     return "x" * 100000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_provider_stats_ownership_is_scoped_to_provider_await(
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+    streaming,
+):
+    provider = ProviderStatsContextProbe()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=streaming,
+        provider_stats_managed_by_agent=True,
+    )
+
+    responses = []
+    async for response in runner._iter_llm_responses():
+        responses.append(response)
+        assert provider_module.provider_stats_managed_by_agent.get() is False
+
+    assert responses
+    assert provider.observed_values == [True]
+    assert provider_module.provider_stats_managed_by_agent.get() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_provider_stats_ownership_is_restored_after_provider_failure(
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+    streaming,
+):
+    provider = ProviderStatsContextProbe(fail=True)
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=streaming,
+        provider_stats_managed_by_agent=True,
+    )
+
+    with pytest.raises(RuntimeError, match="provider call failed"):
+        async for _ in runner._iter_llm_responses():
+            pass
+
+    assert provider.observed_values == [True]
+    assert provider_module.provider_stats_managed_by_agent.get() is False
 
 
 @pytest.mark.asyncio

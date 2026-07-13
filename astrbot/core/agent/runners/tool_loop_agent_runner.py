@@ -6,7 +6,7 @@ import time
 import traceback
 import typing as T
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -46,7 +46,7 @@ from astrbot.core.provider.modalities import (
     log_context_sanitize_stats,
     sanitize_contexts_by_modalities,
 )
-from astrbot.core.provider.provider import Provider
+from astrbot.core.provider.provider import Provider, provider_stats_managed_by_agent
 
 from ..context.compressor import ContextCompressor
 from ..context.config import ContextConfig
@@ -226,6 +226,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         tool_schema_mode: str | None = "full",
         fallback_providers: list[Provider] | None = None,
         request_max_retries: int | None = None,
+        provider_stats_managed_by_agent: bool = False,
         tool_result_overflow_dir: str | None = None,
         read_tool: FunctionTool | None = None,
         **kwargs: T.Any,
@@ -240,6 +241,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.custom_token_counter = custom_token_counter
         self.custom_compressor = custom_compressor
         self.request_max_retries = request_max_retries
+        self.provider_stats_managed_by_agent = provider_stats_managed_by_agent
         self.tool_result_overflow_dir = tool_result_overflow_dir
         self.read_tool = read_tool
         self._tool_result_token_counter = EstimateTokenCounter()
@@ -472,6 +474,21 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             preview = preview[:next_len]
         return preview
 
+    @contextmanager
+    def _provider_stats_scope(self) -> T.Iterator[None]:
+        """Apply provider-stat ownership while awaiting one provider operation.
+
+        Yields:
+            Control while the provider operation uses this runner's ownership mode.
+        """
+        token = provider_stats_managed_by_agent.set(
+            self.provider_stats_managed_by_agent
+        )
+        try:
+            yield
+        finally:
+            provider_stats_managed_by_agent.reset(token)
+
     async def _iter_llm_responses(
         self, *, include_model: bool = True
     ) -> T.AsyncGenerator[LLMResponse, None]:
@@ -489,10 +506,20 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             payload["model"] = self.req.model
         if self.streaming:
             stream = self.provider.text_chat_stream(**payload)
-            async for resp in stream:  # type: ignore
-                yield resp
+            try:
+                while True:
+                    try:
+                        with self._provider_stats_scope():
+                            response = await anext(stream)
+                    except StopAsyncIteration:
+                        break
+                    yield response
+            finally:
+                await stream.aclose()
         else:
-            yield await self.provider.text_chat(**payload)
+            with self._provider_stats_scope():
+                response = await self.provider.text_chat(**payload)
+            yield response
 
     async def _iter_llm_responses_with_fallback(
         self,
@@ -1322,16 +1349,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
-                requery_resp = await self.provider.text_chat(
-                    contexts=self._sanitize_contexts_for_provider(contexts),
-                    func_tool=param_subset,
-                    model=self.req.model,
-                    session_id=self.req.session_id,
-                    extra_user_content_parts=self.req.extra_user_content_parts,
-                    # tool_choice="required",
-                    abort_signal=self._abort_signal,
-                    request_max_retries=self.request_max_retries,
-                )
+                with self._provider_stats_scope():
+                    requery_resp = await self.provider.text_chat(
+                        contexts=self._sanitize_contexts_for_provider(contexts),
+                        func_tool=param_subset,
+                        model=self.req.model,
+                        session_id=self.req.session_id,
+                        extra_user_content_parts=self.req.extra_user_content_parts,
+                        # tool_choice="required",
+                        abort_signal=self._abort_signal,
+                        request_max_retries=self.request_max_retries,
+                    )
                 if requery_resp:
                     llm_resp = requery_resp
 
@@ -1349,16 +1377,19 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
-                    repair_resp = await self.provider.text_chat(
-                        contexts=self._sanitize_contexts_for_provider(repair_contexts),
-                        func_tool=param_subset,
-                        model=self.req.model,
-                        session_id=self.req.session_id,
-                        extra_user_content_parts=self.req.extra_user_content_parts,
-                        # tool_choice="required",
-                        abort_signal=self._abort_signal,
-                        request_max_retries=self.request_max_retries,
-                    )
+                    with self._provider_stats_scope():
+                        repair_resp = await self.provider.text_chat(
+                            contexts=self._sanitize_contexts_for_provider(
+                                repair_contexts
+                            ),
+                            func_tool=param_subset,
+                            model=self.req.model,
+                            session_id=self.req.session_id,
+                            extra_user_content_parts=self.req.extra_user_content_parts,
+                            # tool_choice="required",
+                            abort_signal=self._abort_signal,
+                            request_max_retries=self.request_max_retries,
+                        )
                     if repair_resp:
                         llm_resp = repair_resp
 
