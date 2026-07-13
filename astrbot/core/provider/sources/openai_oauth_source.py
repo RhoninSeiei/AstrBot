@@ -2,6 +2,7 @@ import base64
 import inspect
 import json
 import mimetypes
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any
 import httpx
 
 from astrbot import logger
+from astrbot.core import db_helper
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.oauth.openai_oauth import (
@@ -21,6 +23,7 @@ from astrbot.core.provider.oauth.openai_oauth import (
 from astrbot.core.provider.oauth.openai_oauth_shared_state import (
     OpenAIOAuthSharedState,
 )
+from astrbot.core.provider.provider import provider_stats_managed_by_agent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ..register import register_provider_adapter
@@ -251,9 +254,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
     async def _refresh_oauth_token(self) -> bool:
         self._sync_oauth_credentials_from_shared()
         refresh_version, credentials = self._oauth_shared_state.versioned_snapshot()
-        refresh_token_value = str(
-            credentials.get("oauth_refresh_token") or ""
-        ).strip()
+        refresh_token_value = str(credentials.get("oauth_refresh_token") or "").strip()
         if not refresh_token_value:
             return False
 
@@ -306,9 +307,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         return headers
 
     def _build_backend_headers_with_version(self) -> tuple[dict[str, str], int]:
-        attempted_version, credentials = (
-            self._oauth_shared_state.versioned_snapshot()
-        )
+        attempted_version, credentials = self._oauth_shared_state.versioned_snapshot()
         self.provider_config.update(credentials)
         access_token = str(credentials.get("oauth_access_token") or "").strip()
         account_id = (
@@ -377,16 +376,16 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
     async def _request_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_fresh_oauth_token()
-        status_code, text, attempted_version = await self._request_backend_once(
-            payload
-        )
+        status_code, text, attempted_version = await self._request_backend_once(payload)
 
         if status_code in {401, 403}:
             refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
-                status_code, text, _attempted_version = (
-                    await self._request_backend_once(payload)
-                )
+                (
+                    status_code,
+                    text,
+                    _attempted_version,
+                ) = await self._request_backend_once(payload)
 
         if status_code < 200 or status_code >= 300:
             raise Exception(self._format_backend_error(status_code, text))
@@ -438,16 +437,18 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
     async def _request_image_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_fresh_oauth_token()
-        status_code, text, attempted_version = (
-            await self._request_image_backend_once(payload)
+        status_code, text, attempted_version = await self._request_image_backend_once(
+            payload
         )
 
         if status_code in {401, 403}:
             refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
-                status_code, text, _attempted_version = (
-                    await self._request_image_backend_once(payload)
-                )
+                (
+                    status_code,
+                    text,
+                    _attempted_version,
+                ) = await self._request_image_backend_once(payload)
 
         if status_code < 200 or status_code >= 300:
             raise Exception(self._format_backend_error(status_code, text))
@@ -682,6 +683,53 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             output=output_tokens,
         )
 
+    async def _record_provider_stat(
+        self,
+        *,
+        request_kind: str,
+        status: str,
+        usage: TokenUsage | None,
+        start_time: float,
+        end_time: float,
+        model: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Persist one OAuth provider call without affecting its caller.
+
+        Args:
+            request_kind: Logical call type used by the synthetic UMO.
+            status: Provider call status stored in the database.
+            usage: Parsed token usage, or None when the backend omitted it.
+            start_time: Epoch time immediately before the public call.
+            end_time: Epoch time immediately after the public call.
+            model: Explicit request model when supplied.
+            session_id: Session identifier when supplied by the caller.
+        """
+        provider_id = str(self.provider_config.get("id") or self.meta().id)
+        try:
+            await db_helper.insert_provider_stat(
+                umo=session_id or f"provider:{provider_id}:{request_kind}",
+                provider_id=provider_id,
+                provider_model=model or self.get_model(),
+                status=status,
+                stats={
+                    "token_usage": {
+                        "input_other": usage.input_other if usage else 0,
+                        "input_cached": usage.input_cached if usage else 0,
+                        "output": usage.output if usage else 0,
+                    },
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "time_to_first_token": 0.0,
+                },
+                agent_type="provider",
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record OpenAI OAuth provider statistics.",
+                exc_info=True,
+            )
+
     def _convert_tools_to_backend_format(
         self, tool_list: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -834,6 +882,88 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             llm_response.usage = usage
         return llm_response
 
+    async def text_chat(
+        self,
+        prompt=None,
+        session_id=None,
+        image_urls=None,
+        audio_urls=None,
+        func_tool=None,
+        contexts=None,
+        system_prompt=None,
+        tool_calls_result=None,
+        model=None,
+        extra_user_content_parts=None,
+        tool_choice="auto",
+        request_max_retries=None,
+        **kwargs,
+    ) -> LLMResponse:
+        """Run an OAuth chat request and account for direct provider usage.
+
+        Args:
+            prompt: User prompt for a new conversation turn.
+            session_id: Session identifier used by provider statistics.
+            image_urls: Image inputs attached to the user message.
+            audio_urls: Audio inputs attached to the user message.
+            func_tool: Tools available to the model.
+            contexts: Existing conversation messages.
+            system_prompt: System instruction for the request.
+            tool_calls_result: Results returned from earlier tool calls.
+            model: Explicit model override.
+            extra_user_content_parts: Additional user message content parts.
+            tool_choice: Tool selection policy.
+            request_max_retries: Maximum attempts for retryable backend requests.
+            **kwargs: Additional provider request options.
+
+        Returns:
+            Parsed model response from the inherited OpenAI provider.
+
+        Raises:
+            Exception: Re-raises the original provider exception unchanged.
+        """
+        managed_by_agent = provider_stats_managed_by_agent.get()
+        start_time = time.time()
+        try:
+            response = await super().text_chat(
+                prompt=prompt,
+                session_id=session_id,
+                image_urls=image_urls,
+                audio_urls=audio_urls,
+                func_tool=func_tool,
+                contexts=contexts,
+                system_prompt=system_prompt,
+                tool_calls_result=tool_calls_result,
+                model=model,
+                extra_user_content_parts=extra_user_content_parts,
+                tool_choice=tool_choice,
+                request_max_retries=request_max_retries,
+                **kwargs,
+            )
+        except Exception:
+            if not managed_by_agent:
+                await self._record_provider_stat(
+                    request_kind="text",
+                    status="error",
+                    usage=None,
+                    start_time=start_time,
+                    end_time=time.time(),
+                    model=model,
+                    session_id=session_id,
+                )
+            raise
+
+        if not managed_by_agent:
+            await self._record_provider_stat(
+                request_kind="text",
+                status="error" if response.role == "err" else "completed",
+                usage=response.usage,
+                start_time=start_time,
+                end_time=time.time(),
+                model=model,
+                session_id=session_id,
+            )
+        return response
+
     async def _query(
         self,
         payloads: dict,
@@ -926,36 +1056,79 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         reference_images: list[str] | None = None,
         action: str | None = None,
     ) -> list[OpenAIOAuthImageResult]:
-        references = [
-            str(image).strip() for image in reference_images or [] if str(image).strip()
-        ]
-        instructions = str(prompt or "").strip()
-        if not instructions:
-            raise ValueError("图片生成提示词不能为空。")
-        image_input = self._build_image_generation_input(instructions, references)
-        image_action = (action or ("edit" if references else "generate")).strip()
-        if not image_action:
-            image_action = "edit" if references else "generate"
-        results: list[OpenAIOAuthImageResult] = []
-        count = max(1, int(n or 1))
-        for _ in range(count):
-            tool: dict[str, Any] = {
-                "type": "image_generation",
-                "action": image_action,
-            }
-            if size:
-                tool["size"] = size
-            payload = {
-                "model": model or self.get_model(),
-                "input": image_input,
-                "instructions": instructions,
-                "tools": [tool],
-                "tool_choice": {"type": "image_generation"},
-                "stream": True,
-                "store": False,
-            }
-            response = await self._request_image_backend(payload)
-            results.extend(await self._extract_generated_images(response))
+        """Generate images and persist aggregate OAuth token usage.
+
+        Args:
+            prompt: Image generation or editing instruction.
+            model: Explicit model override.
+            size: Requested image dimensions.
+            n: Number of backend image generations.
+            reference_images: Local files, URLs, or data URLs used as references.
+            action: Image tool action override.
+
+        Returns:
+            Extracted image results from all backend generations.
+
+        Raises:
+            Exception: Re-raises validation, backend, or extraction failures.
+        """
+        start_time = time.time()
+        total_usage = TokenUsage()
+        try:
+            references = [
+                str(image).strip()
+                for image in reference_images or []
+                if str(image).strip()
+            ]
+            instructions = str(prompt or "").strip()
+            if not instructions:
+                raise ValueError("图片生成提示词不能为空。")
+            image_input = self._build_image_generation_input(instructions, references)
+            image_action = (action or ("edit" if references else "generate")).strip()
+            if not image_action:
+                image_action = "edit" if references else "generate"
+            results: list[OpenAIOAuthImageResult] = []
+            count = max(1, int(n or 1))
+            for _ in range(count):
+                tool: dict[str, Any] = {
+                    "type": "image_generation",
+                    "action": image_action,
+                }
+                if size:
+                    tool["size"] = size
+                payload = {
+                    "model": model or self.get_model(),
+                    "input": image_input,
+                    "instructions": instructions,
+                    "tools": [tool],
+                    "tool_choice": {"type": "image_generation"},
+                    "stream": True,
+                    "store": False,
+                }
+                response = await self._request_image_backend(payload)
+                response_usage = self._extract_response_usage(response.get("usage"))
+                if response_usage is not None:
+                    total_usage = total_usage + response_usage
+                results.extend(await self._extract_generated_images(response))
+        except Exception:
+            await self._record_provider_stat(
+                request_kind="image",
+                status="error",
+                usage=total_usage,
+                start_time=start_time,
+                end_time=time.time(),
+                model=model,
+            )
+            raise
+
+        await self._record_provider_stat(
+            request_kind="image",
+            status="completed",
+            usage=total_usage,
+            start_time=start_time,
+            end_time=time.time(),
+            model=model,
+        )
         return results
 
     def _build_image_generation_input(

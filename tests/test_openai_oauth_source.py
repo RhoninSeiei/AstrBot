@@ -3,16 +3,21 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+import astrbot.core.provider.provider as provider_module
 import astrbot.core.provider.sources.openai_oauth_source as oauth_source
+from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
 from astrbot.core.provider.oauth.openai_oauth_shared_state import (
     OpenAIOAuthSharedState,
 )
 from astrbot.core.provider.sources.openai_oauth_source import ProviderOpenAIOAuth
+from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -49,6 +54,18 @@ def _make_provider(
         provider_config=provider_config,
         provider_settings={},
     )
+
+
+@pytest.fixture(autouse=True)
+def provider_stat_writer(monkeypatch):
+    writer = AsyncMock()
+    monkeypatch.setattr(
+        oauth_source,
+        "db_helper",
+        SimpleNamespace(insert_provider_stat=writer),
+        raising=False,
+    )
+    return writer
 
 
 def _make_provider_manager_for_oauth_source() -> ProviderManager:
@@ -88,7 +105,11 @@ def test_runtime_configs_share_source_oauth_state_and_credentials():
     }
 
     sol = manager.get_merged_provider_config(
-        {**stale_model_fields, "id": "openai_oauth/gpt-5.6-sol", "model": "gpt-5.6-sol"},
+        {
+            **stale_model_fields,
+            "id": "openai_oauth/gpt-5.6-sol",
+            "model": "gpt-5.6-sol",
+        },
         runtime=True,
     )
     terra = manager.get_merged_provider_config(
@@ -297,9 +318,7 @@ async def test_shared_oauth_state_refreshes_once_across_provider_instances(
         return {
             "access_token": "shared-new-access",
             "refresh_token": "shared-new-refresh",
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "email": "shared@example.com",
             "account_id": "shared-account",
         }
@@ -351,9 +370,7 @@ async def test_refresh_does_not_overwrite_newer_source_credentials(monkeypatch):
         return {
             "access_token": "stale-refreshed-access",
             "refresh_token": "stale-refreshed-token",
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "email": "stale@example.com",
             "account_id": "shared-account",
         }
@@ -464,9 +481,7 @@ async def test_shared_oauth_state_refreshes_once_after_concurrent_401(
         return {
             "access_token": "accepted-access",
             "refresh_token": "rotated-refresh",
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
             "email": "shared@example.com",
             "account_id": "shared-account",
         }
@@ -507,9 +522,7 @@ async def test_shared_oauth_state_refreshes_once_after_concurrent_401(
     try:
         sol_response, terra_response = await asyncio.gather(
             getattr(sol, request_method)({"model": "gpt-5.6-sol", "input": []}),
-            getattr(terra, request_method)(
-                {"model": "gpt-5.6-terra", "input": []}
-            ),
+            getattr(terra, request_method)({"model": "gpt-5.6-terra", "input": []}),
         )
 
         assert refresh_calls == 1
@@ -677,7 +690,9 @@ async def test_request_backend_sends_codex_identity_and_residency_headers(
 
 
 @pytest.mark.asyncio
-async def test_request_backend_reports_version_used_by_authorization_header(monkeypatch):
+async def test_request_backend_reports_version_used_by_authorization_header(
+    monkeypatch,
+):
     sent_requests: list[dict] = []
     shared_state = OpenAIOAuthSharedState(
         "openai_oauth",
@@ -963,6 +978,176 @@ async def test_query_rejects_ultra_as_single_provider_request():
 
 
 @pytest.mark.asyncio
+async def test_text_chat_records_provider_usage(monkeypatch, provider_stat_writer):
+    expected_response = LLMResponse(
+        role="assistant",
+        completion_text="pong",
+        usage=TokenUsage(input_other=3, input_cached=2, output=4),
+    )
+
+    async def fake_text_chat(_self, **kwargs):
+        return expected_response
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    try:
+        response = await provider.text_chat(
+            prompt="ping",
+            session_id="platform:message:session",
+        )
+
+        assert response is expected_response
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["umo"] == "platform:message:session"
+        assert call["provider_id"] == "test-openai-oauth"
+        assert call["provider_model"] == "gpt-5.4"
+        assert call["status"] == "completed"
+        assert call["agent_type"] == "provider"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 3,
+            "input_cached": 2,
+            "output": 4,
+        }
+        assert call["stats"]["time_to_first_token"] == 0.0
+        assert call["stats"]["end_time"] >= call["stats"]["start_time"]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "expected_status"),
+    [("assistant", "completed"), ("err", "error")],
+)
+async def test_text_chat_records_calls_without_usage(
+    monkeypatch,
+    provider_stat_writer,
+    role,
+    expected_status,
+):
+    async def fake_text_chat(_self, **kwargs):
+        return LLMResponse(role=role, completion_text="result")
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    try:
+        await provider.text_chat(prompt="ping")
+
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["umo"] == "provider:test-openai-oauth:text"
+        assert call["status"] == expected_status
+        assert call["stats"]["token_usage"] == {
+            "input_other": 0,
+            "input_cached": 0,
+            "output": 0,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_records_exception_once_and_reraises(
+    monkeypatch,
+    provider_stat_writer,
+):
+    expected_error = RuntimeError("backend failed")
+
+    async def fake_text_chat(_self, **kwargs):
+        raise expected_error
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider_stat_writer.side_effect = RuntimeError("database unavailable")
+    provider = _make_provider()
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await provider.text_chat(prompt="ping")
+
+        assert raised.value is expected_error
+        provider_stat_writer.assert_awaited_once()
+        assert provider_stat_writer.await_args.kwargs["status"] == "error"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_skips_provider_record_when_agent_owns_stats(
+    monkeypatch,
+    provider_stat_writer,
+):
+    async def fake_text_chat(_self, **kwargs):
+        return LLMResponse(
+            role="assistant",
+            completion_text="pong",
+            usage=TokenUsage(input_other=2, output=1),
+        )
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    token = provider_module.provider_stats_managed_by_agent.set(True)
+    try:
+        await provider.text_chat(prompt="ping")
+
+        provider_stat_writer.assert_not_awaited()
+    finally:
+        provider_module.provider_stats_managed_by_agent.reset(token)
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_stream_records_one_provider_call(
+    monkeypatch,
+    provider_stat_writer,
+):
+    async def fake_text_chat(_self, **kwargs):
+        return LLMResponse(
+            role="assistant",
+            completion_text="pong",
+            usage=TokenUsage(input_other=2, output=1),
+        )
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    try:
+        responses = [
+            response
+            async for response in provider.text_chat_stream(
+                prompt="ping",
+                session_id="stream-session",
+            )
+        ]
+
+        assert len(responses) == 1
+        provider_stat_writer.assert_awaited_once()
+        assert provider_stat_writer.await_args.kwargs["umo"] == "stream-session"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_provider_stat_failure_does_not_change_text_result(
+    monkeypatch,
+    provider_stat_writer,
+):
+    expected_response = LLMResponse(role="assistant", completion_text="pong")
+
+    async def fake_text_chat(_self, **kwargs):
+        return expected_response
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider_stat_writer.side_effect = RuntimeError("database unavailable")
+    provider = _make_provider()
+    try:
+        response = await provider.text_chat(prompt="ping")
+
+        assert response is expected_response
+        provider_stat_writer.assert_awaited_once()
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_query_accepts_request_max_retries_and_preserves_responses_payload():
     requested_payloads: list[dict] = []
     provider = _make_provider()
@@ -1013,7 +1198,7 @@ async def test_query_accepts_request_max_retries_and_preserves_responses_payload
 
 
 @pytest.mark.asyncio
-async def test_generate_image_extracts_base64_result(tmp_path):
+async def test_generate_image_extracts_base64_result(tmp_path, provider_stat_writer):
     image_bytes = b"\x89PNG\r\n\x1a\nsample"
     requested_payloads: list[dict] = []
     provider = _make_provider(
@@ -1025,13 +1210,18 @@ async def test_generate_image_extracts_base64_result(tmp_path):
     async def fake_request_image_backend(payload: dict):
         requested_payloads.append(payload)
         return {
+            "usage": {
+                "input_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 2},
+                "output_tokens": 4,
+            },
             "output": [
                 {
                     "type": "image_generation_call",
                     "result": base64.b64encode(image_bytes).decode(),
                     "revised_prompt": "revised",
                 }
-            ]
+            ],
         }
 
     provider._request_image_backend = fake_request_image_backend
@@ -1069,6 +1259,220 @@ async def test_generate_image_extracts_base64_result(tmp_path):
         assert results[0].mime_type == "image/png"
         assert results[0].revised_prompt == "revised"
         assert Path(results[0].path).read_bytes() == image_bytes
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["umo"] == "provider:test-openai-oauth:image"
+        assert call["provider_model"] == "gpt-5.4"
+        assert call["status"] == "completed"
+        assert call["agent_type"] == "provider"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 3,
+            "input_cached": 2,
+            "output": 4,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_records_completed_call_without_usage(
+    tmp_path,
+    provider_stat_writer,
+):
+    image_bytes = b"\x89PNG\r\n\x1a\nno-usage"
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode(),
+                }
+            ]
+        }
+
+    provider._request_image_backend = fake_request_image_backend
+    try:
+        results = await provider.generate_image(prompt="draw an icon")
+
+        assert len(results) == 1
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["status"] == "completed"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 0,
+            "input_cached": 0,
+            "output": 0,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_aggregates_usage_into_one_provider_call(
+    tmp_path,
+    provider_stat_writer,
+):
+    image_bytes = b"\x89PNG\r\n\x1a\nmultiple"
+    backend_calls = 0
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        nonlocal backend_calls
+        backend_calls += 1
+        return {
+            "usage": {
+                "input_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 1},
+                "output_tokens": 2,
+            },
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode(),
+                }
+            ],
+        }
+
+    provider._request_image_backend = fake_request_image_backend
+    try:
+        results = await provider.generate_image(prompt="draw two icons", n=2)
+
+        assert backend_calls == 2
+        assert len(results) == 2
+        provider_stat_writer.assert_awaited_once()
+        assert provider_stat_writer.await_args.kwargs["stats"]["token_usage"] == {
+            "input_other": 6,
+            "input_cached": 2,
+            "output": 4,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_records_backend_failure_and_reraises(
+    tmp_path,
+    provider_stat_writer,
+):
+    expected_error = RuntimeError("image backend failed")
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        raise expected_error
+
+    provider._request_image_backend = fake_request_image_backend
+    provider_stat_writer.side_effect = RuntimeError("database unavailable")
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await provider.generate_image(prompt="draw an icon")
+
+        assert raised.value is expected_error
+        provider_stat_writer.assert_awaited_once()
+        assert provider_stat_writer.await_args.kwargs["status"] == "error"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_records_extraction_failure(
+    tmp_path,
+    provider_stat_writer,
+):
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        return {
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "output": [],
+        }
+
+    provider._request_image_backend = fake_request_image_backend
+    try:
+        with pytest.raises(Exception, match="Codex"):
+            await provider.generate_image(prompt="draw an icon")
+
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["status"] == "error"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 3,
+            "input_cached": 0,
+            "output": 1,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_records_validation_failure(provider_stat_writer):
+    provider = _make_provider()
+    try:
+        with pytest.raises(ValueError):
+            await provider.generate_image(prompt="")
+
+        provider_stat_writer.assert_awaited_once()
+        assert provider_stat_writer.await_args.kwargs["status"] == "error"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_records_when_agent_owns_text_stats(
+    tmp_path,
+    provider_stat_writer,
+):
+    image_bytes = b"\x89PNG\r\n\x1a\nowned-agent"
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode(),
+                }
+            ]
+        }
+
+    provider._request_image_backend = fake_request_image_backend
+    token = provider_module.provider_stats_managed_by_agent.set(True)
+    try:
+        await provider.generate_image(prompt="draw an icon")
+
+        provider_stat_writer.assert_awaited_once()
+    finally:
+        provider_module.provider_stats_managed_by_agent.reset(token)
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_provider_stat_failure_does_not_change_image_result(
+    tmp_path,
+    provider_stat_writer,
+):
+    image_bytes = b"\x89PNG\r\n\x1a\nstats-failure"
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        return {
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "result": base64.b64encode(image_bytes).decode(),
+                }
+            ]
+        }
+
+    provider._request_image_backend = fake_request_image_backend
+    provider_stat_writer.side_effect = RuntimeError("database unavailable")
+    try:
+        results = await provider.generate_image(prompt="draw an icon")
+
+        assert len(results) == 1
+        assert Path(results[0].path).read_bytes() == image_bytes
+        provider_stat_writer.assert_awaited_once()
     finally:
         await provider.terminate()
 
