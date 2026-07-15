@@ -18,7 +18,7 @@ from .util import (
     check_admin_permission,
     format_exception_message,
     is_local_runtime,
-    workspace_root,
+    workspace_root_for_context,
 )
 
 _COMPUTER_RUNTIME_TOOL_CONFIG = {
@@ -104,9 +104,7 @@ class ExecuteShellTool(FunctionTool):
         try:
             cwd: str | None = None
             if is_local_runtime(context):
-                current_workspace_root = workspace_root(
-                    context.context.event.unified_msg_origin
-                )
+                current_workspace_root = await workspace_root_for_context(context)
                 current_workspace_root.mkdir(parents=True, exist_ok=True)
                 cwd = str(current_workspace_root)
 
