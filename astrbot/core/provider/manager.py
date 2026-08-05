@@ -532,7 +532,6 @@ class ProviderManager:
                     TEIRerankProvider as TEIRerankProvider,
                 )
 
-
     async def _persist_openai_oauth_provider_source_patch(
         self,
         provider_source_id: str,
@@ -641,10 +640,9 @@ class ProviderManager:
                 )
                 if (
                     provider_source.get("provider") == "openai"
-                    and provider_source.get("type")
-                    == "openai_oauth_chat_completion"
+                    and provider_source.get("type") == "openai_oauth_chat_completion"
                 ):
-                    provider_only_fields = {
+                    model_authoritative_fields = {
                         "id",
                         "provider_source_id",
                         "model",
@@ -652,26 +650,13 @@ class ProviderManager:
                         "custom_extra_body",
                         "enable",
                     }
-                    merged_config = {
-                        **provider_source,
-                        **{
-                            key: value
-                            for key, value in pc.items()
-                            if key in provider_only_fields
-                        },
-                    }
-                    merged_config["id"] = pc["id"]
-                    merged_config["type"] = provider_source.get("type")
-                    merged_config["provider"] = provider_source.get("provider")
-                    merged_config["provider_type"] = provider_source.get(
-                        "provider_type"
-                    )
+                    merged_config = {**pc, **provider_source}
+                    for field_name in model_authoritative_fields:
+                        if field_name in pc:
+                            merged_config[field_name] = pc[field_name]
                     if provider_source.get("auth_mode") == "openai_oauth":
                         merged_config["key"] = ["__openai_oauth__"]
-                    if (
-                        runtime
-                        and provider_source.get("auth_mode") == "openai_oauth"
-                    ):
+                    if runtime and provider_source.get("auth_mode") == "openai_oauth":
                         merged_config["oauth_shared_state"] = (
                             self.get_openai_oauth_shared_state(
                                 provider_source_id,

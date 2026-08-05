@@ -128,6 +128,33 @@ def test_runtime_configs_share_source_oauth_state_and_credentials():
     assert sol["oauth_refresh_token"] == "source-refresh"
 
 
+def test_oauth_model_config_preserves_model_fields_while_source_credentials_win():
+    manager = _make_provider_manager_for_oauth_source()
+
+    merged = manager.get_merged_provider_config(
+        {
+            "id": "openai_oauth/gpt-future-codex",
+            "provider_source_id": "openai_oauth",
+            "model": "gpt-future-codex",
+            "max_context_tokens": 196000,
+            "reasoning": {"effort": "high", "summary": "detailed"},
+            "future_model_level_option": {"enabled": True},
+            "oauth_access_token": "stale-access",
+            "oauth_refresh_token": "stale-refresh",
+            "oauth_expires_at": "2000-01-01T00:00:00+00:00",
+            "oauth_account_id": "stale-account",
+        }
+    )
+
+    assert merged["max_context_tokens"] == 196000
+    assert merged["reasoning"] == {"effort": "high", "summary": "detailed"}
+    assert merged["future_model_level_option"] == {"enabled": True}
+    assert merged["oauth_access_token"] == "source-access"
+    assert merged["oauth_refresh_token"] == "source-refresh"
+    assert merged["oauth_expires_at"] == "2026-07-22T16:58:10+00:00"
+    assert merged["oauth_account_id"] == "source-account"
+
+
 def test_manual_source_cannot_be_overridden_by_stale_model_oauth_fields():
     manager = _make_provider_manager_for_oauth_source()
     manager.provider_sources_config[0].update(

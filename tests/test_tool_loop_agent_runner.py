@@ -11,6 +11,7 @@ import pytest
 # 将项目根目录添加到 sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import astrbot.core.provider.provider as provider_module
 from astrbot.core.agent.agent import Agent
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.hooks import BaseAgentRunHooks
@@ -475,6 +476,40 @@ def runner():
 
 def _make_large_tool_result_text() -> str:
     return "x" * 100000
+
+
+@pytest.mark.asyncio
+async def test_runner_marks_provider_stats_as_agent_managed_during_provider_call(
+    runner, provider_request, mock_tool_executor, mock_hooks
+):
+    class ProviderStatsProbe(MockProvider):
+        def __init__(self):
+            super().__init__()
+            self.observed_values: list[bool] = []
+
+        async def text_chat(self, **kwargs) -> LLMResponse:
+            del kwargs
+            self.observed_values.append(
+                provider_module.provider_stats_managed_by_agent.get()
+            )
+            return LLMResponse(role="assistant", completion_text="final")
+
+    provider = ProviderStatsProbe()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+        provider_stats_managed_by_agent=True,
+    )
+
+    responses = [response async for response in runner._iter_llm_responses()]
+
+    assert len(responses) == 1
+    assert provider.observed_values == [True]
+    assert provider_module.provider_stats_managed_by_agent.get() is False
 
 
 @pytest.mark.asyncio
