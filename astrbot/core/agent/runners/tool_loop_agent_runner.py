@@ -1,12 +1,11 @@
 import asyncio
 import copy
-import json
 import sys
 import time
 import traceback
 import typing as T
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -46,7 +45,7 @@ from astrbot.core.provider.modalities import (
     log_context_sanitize_stats,
     sanitize_contexts_by_modalities,
 )
-from astrbot.core.provider.provider import Provider, provider_stats_managed_by_agent
+from astrbot.core.provider.provider import Provider
 
 from ..context.compressor import ContextCompressor
 from ..context.config import ContextConfig
@@ -149,21 +148,23 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
     MALFORMED_TOOL_NAME_PLACEHOLDER = "__malformed_tool_name__"
     REPEATED_TOOL_NOTICE_L1_TEMPLATE = (
         "\n\n[SYSTEM NOTICE] By the way, you have executed the same tool "
-        "`{tool_name}` {streak} times consecutively. Double-check whether another "
-        "tool, different arguments, or a summary would move the task forward better."
+        "`{tool_name}` with the same arguments {streak} times consecutively. "
+        "Double-check whether another tool, different arguments, or a summary would "
+        "move the task forward better."
     )
     REPEATED_TOOL_NOTICE_L2_TEMPLATE = (
         "\n\n[SYSTEM NOTICE] Important: you have executed the same tool "
-        "`{tool_name}` {streak} times consecutively. Unless this repetition is "
-        "clearly necessary, stop repeating the same action and either switch "
-        "tools, refine parameters, or summarize what is still missing."
+        "`{tool_name}` with the same arguments {streak} times consecutively. "
+        "Unless this repetition is clearly necessary, stop repeating the same action "
+        "and either switch tools, refine parameters, or summarize what is still "
+        "missing."
     )
     REPEATED_TOOL_NOTICE_L3_TEMPLATE = (
         "\n\n[SYSTEM NOTICE] Important: you have executed the same tool "
-        "`{tool_name}` {streak} times consecutively. Repetition is now very "
-        "high. Continue only if each call is clearly producing new information. "
-        "Otherwise, change strategy, adjust arguments, or explain the limitation "
-        "to the user."
+        "`{tool_name}` with the same arguments {streak} times consecutively. "
+        "Repetition is now very high. Continue only if each call is clearly producing "
+        "new information. Otherwise, change strategy, adjust arguments, or explain "
+        "the limitation to the user."
     )
     TOOL_RESULT_OVERFLOW_NOTICE_TEMPLATE = (
         "Truncated tool output preview shown above. "
@@ -227,7 +228,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         tool_schema_mode: str | None = "full",
         fallback_providers: list[Provider] | None = None,
         request_max_retries: int | None = None,
-        provider_stats_managed_by_agent: bool = False,
         tool_result_overflow_dir: str | None = None,
         read_tool: FunctionTool | None = None,
         **kwargs: T.Any,
@@ -242,7 +242,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.custom_token_counter = custom_token_counter
         self.custom_compressor = custom_compressor
         self.request_max_retries = request_max_retries
-        self.provider_stats_managed_by_agent = provider_stats_managed_by_agent
         self.tool_result_overflow_dir = tool_result_overflow_dir
         self.read_tool = read_tool
         self._tool_result_token_counter = EstimateTokenCounter()
@@ -283,7 +282,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._abort_signal = asyncio.Event()
         self._pending_follow_ups: list[FollowUpTicket] = []
         self._follow_up_seq = 0
-        self._last_tool_call_streak_key: tuple[str, str] | None = None
+        self._last_tool_name: str | None = None
+        self._last_tool_args: dict[str, T.Any] | None = None
         self._same_tool_streak = 0
 
         # These two are used for tool schema mode handling
@@ -325,22 +325,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         self.stats = AgentStats()
         self.stats.start_time = time.time()
-
-    @staticmethod
-    def _tool_call_streak_key(
-        tool_name: str,
-        tool_args: dict[str, T.Any],
-    ) -> tuple[str, str]:
-        try:
-            args_fingerprint = json.dumps(
-                tool_args,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-        except Exception:
-            args_fingerprint = repr(tool_args)
-        return tool_name, args_fingerprint
 
     def _read_tool_hint(self) -> str:
         if self.read_tool is not None:
@@ -475,21 +459,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             preview = preview[:next_len]
         return preview
 
-    @contextmanager
-    def _provider_stats_scope(self) -> T.Iterator[None]:
-        """Apply provider-stat ownership while awaiting one provider operation.
-
-        Yields:
-            Control while the provider operation uses this runner's ownership mode.
-        """
-        token = provider_stats_managed_by_agent.set(
-            self.provider_stats_managed_by_agent
-        )
-        try:
-            yield
-        finally:
-            provider_stats_managed_by_agent.reset(token)
-
     async def _iter_llm_responses(
         self, *, include_model: bool = True
     ) -> T.AsyncGenerator[LLMResponse, None]:
@@ -507,20 +476,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             payload["model"] = self.req.model
         if self.streaming:
             stream = self.provider.text_chat_stream(**payload)
-            try:
-                while True:
-                    try:
-                        with self._provider_stats_scope():
-                            response = await anext(stream)
-                    except StopAsyncIteration:
-                        break
-                    yield response
-            finally:
-                await stream.aclose()
+            async for resp in stream:  # type: ignore
+                yield resp
         else:
-            with self._provider_stats_scope():
-                response = await self.provider.text_chat(**payload)
-            yield response
+            yield await self.provider.text_chat(**payload)
 
     async def _iter_llm_responses_with_fallback(
         self,
@@ -707,13 +666,28 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         return f"{content}{notice}"
 
     def _track_tool_call_streak(
-        self, tool_name: str, tool_args: dict[str, T.Any]
+        self,
+        tool_name: str,
+        tool_args: dict[str, T.Any] | None,
     ) -> int:
-        streak_key = self._tool_call_streak_key(tool_name, tool_args)
-        if streak_key == self._last_tool_call_streak_key:
+        """Track consecutive tool calls with the same name and arguments.
+
+        Args:
+            tool_name: Name of the called tool.
+            tool_args: Arguments passed to the tool.
+
+        Returns:
+            Number of consecutive calls with the same name and arguments.
+        """
+        normalized_args = {} if tool_args is None else tool_args
+        if (
+            tool_name == self._last_tool_name
+            and normalized_args == self._last_tool_args
+        ):
             self._same_tool_streak += 1
         else:
-            self._last_tool_call_streak_key = streak_key
+            self._last_tool_name = tool_name
+            self._last_tool_args = copy.deepcopy(normalized_args)
             self._same_tool_streak = 1
         return self._same_tool_streak
 
@@ -827,6 +801,15 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 self.stats.current_context_tokens = llm_response.usage.input
                 if self.req.conversation:
                     self.req.conversation.token_usage = llm_response.usage.total
+            yield AgentResponse(
+                type="agent_stats",
+                data=AgentResponseData(
+                    chain=MessageChain(
+                        type="agent_stats",
+                        chain=[Json(data=self.stats.to_dict())],
+                    )
+                ),
+            )
             break  # got final response
 
         if not llm_resp_result:
@@ -967,7 +950,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 parts = None
             tool_calls_result = ToolCallsResult(
                 tool_calls_info=AssistantMessageSegment(
-                    tool_calls=llm_resp.to_openai_to_calls_model(),
+                    tool_calls=llm_resp.to_openai_tool_calls_model(),
                     content=parts,
                 ),
                 tool_calls_result=tool_call_result_blocks,
@@ -1069,12 +1052,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             llm_response.tools_call_args,
             llm_response.tools_call_ids,
         ):
-            # Some APIs may return None for tools with no parameters.
-            if func_tool_args is None:
-                func_tool_args = {}
             tool_result_blocks_start = len(tool_call_result_blocks)
             tool_call_streak = self._track_tool_call_streak(
-                func_tool_name, func_tool_args
+                func_tool_name,
+                func_tool_args,
             )
             yield _HandleFunctionToolsResult.from_message_chain(
                 MessageChain(
@@ -1107,6 +1088,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     func_tool = req.func_tool.get_tool(func_tool_name)
                     available_tools = req.func_tool.names()
 
+                #  Some API may return None for tools with no parameters
+                if func_tool_args is None:
+                    func_tool_args = {}
                 logger.info(f"使用工具：{func_tool_name}，参数：{func_tool_args}")
 
                 if not func_tool:
@@ -1372,17 +1356,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
-                with self._provider_stats_scope():
-                    requery_resp = await self.provider.text_chat(
-                        contexts=self._sanitize_contexts_for_provider(contexts),
-                        func_tool=param_subset,
-                        model=self.req.model,
-                        session_id=self.req.session_id,
-                        extra_user_content_parts=self.req.extra_user_content_parts,
-                        # tool_choice="required",
-                        abort_signal=self._abort_signal,
-                        request_max_retries=self.request_max_retries,
-                    )
+                requery_resp = await self.provider.text_chat(
+                    contexts=self._sanitize_contexts_for_provider(contexts),
+                    func_tool=param_subset,
+                    model=self.req.model,
+                    session_id=self.req.session_id,
+                    extra_user_content_parts=self.req.extra_user_content_parts,
+                    # tool_choice="required",
+                    abort_signal=self._abort_signal,
+                    request_max_retries=self.request_max_retries,
+                )
                 if requery_resp:
                     llm_resp = requery_resp
                     self._sanitize_malformed_tool_calls(llm_resp)
@@ -1401,19 +1384,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
-                    with self._provider_stats_scope():
-                        repair_resp = await self.provider.text_chat(
-                            contexts=self._sanitize_contexts_for_provider(
-                                repair_contexts
-                            ),
-                            func_tool=param_subset,
-                            model=self.req.model,
-                            session_id=self.req.session_id,
-                            extra_user_content_parts=self.req.extra_user_content_parts,
-                            # tool_choice="required",
-                            abort_signal=self._abort_signal,
-                            request_max_retries=self.request_max_retries,
-                        )
+                    repair_resp = await self.provider.text_chat(
+                        contexts=self._sanitize_contexts_for_provider(repair_contexts),
+                        func_tool=param_subset,
+                        model=self.req.model,
+                        session_id=self.req.session_id,
+                        extra_user_content_parts=self.req.extra_user_content_parts,
+                        # tool_choice="required",
+                        abort_signal=self._abort_signal,
+                        request_max_retries=self.request_max_retries,
+                    )
                     if repair_resp:
                         llm_resp = repair_resp
                         self._sanitize_malformed_tool_calls(llm_resp)

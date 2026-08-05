@@ -11,7 +11,6 @@ import pytest
 # 将项目根目录添加到 sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import astrbot.core.provider.provider as provider_module
 from astrbot.core.agent.agent import Agent
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.hooks import BaseAgentRunHooks
@@ -81,29 +80,6 @@ class MockProvider(Provider):
         yield response
         response.is_chunk = False
         yield response
-
-
-class ProviderStatsContextProbe(MockProvider):
-    def __init__(self, *, fail: bool = False):
-        super().__init__()
-        self.fail = fail
-        self.observed_values: list[bool] = []
-
-    async def text_chat(self, **kwargs) -> LLMResponse:
-        self.observed_values.append(
-            provider_module.provider_stats_managed_by_agent.get()
-        )
-        if self.fail:
-            raise RuntimeError("provider call failed")
-        return LLMResponse(role="assistant", completion_text="done")
-
-    async def text_chat_stream(self, **kwargs):
-        self.observed_values.append(
-            provider_module.provider_stats_managed_by_agent.get()
-        )
-        if self.fail:
-            raise RuntimeError("provider call failed")
-        yield LLMResponse(role="assistant", completion_text="done")
 
 
 class MockToolExecutor:
@@ -347,10 +323,14 @@ class CapturingToolLoopProvider(MockProvider):
 
 
 class SequentialToolProvider(MockProvider):
-    def __init__(self, tool_sequence: list[str], *, same_args: bool = False):
+    def __init__(
+        self,
+        tool_sequence: list[str],
+        tool_args_sequence: list[dict[str, Any]] | None = None,
+    ):
         super().__init__()
         self.tool_sequence = tool_sequence
-        self.same_args = same_args
+        self.tool_args_sequence = tool_args_sequence
 
     async def text_chat(self, **kwargs) -> LLMResponse:
         self.call_count += 1
@@ -364,8 +344,8 @@ class SequentialToolProvider(MockProvider):
 
         tool_name = self.tool_sequence[self.call_count - 1]
         tool_args = (
-            {"query": "same"}
-            if self.same_args
+            self.tool_args_sequence[self.call_count - 1]
+            if self.tool_args_sequence is not None
             else {"query": f"step-{self.call_count}"}
         )
         return LLMResponse(
@@ -495,64 +475,6 @@ def runner():
 
 def _make_large_tool_result_text() -> str:
     return "x" * 100000
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("streaming", [False, True])
-async def test_provider_stats_ownership_is_scoped_to_provider_await(
-    runner,
-    provider_request,
-    mock_tool_executor,
-    mock_hooks,
-    streaming,
-):
-    provider = ProviderStatsContextProbe()
-    await runner.reset(
-        provider=provider,
-        request=provider_request,
-        run_context=ContextWrapper(context=None),
-        tool_executor=mock_tool_executor,
-        agent_hooks=mock_hooks,
-        streaming=streaming,
-        provider_stats_managed_by_agent=True,
-    )
-
-    responses = []
-    async for response in runner._iter_llm_responses():
-        responses.append(response)
-        assert provider_module.provider_stats_managed_by_agent.get() is False
-
-    assert responses
-    assert provider.observed_values == [True]
-    assert provider_module.provider_stats_managed_by_agent.get() is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("streaming", [False, True])
-async def test_provider_stats_ownership_is_restored_after_provider_failure(
-    runner,
-    provider_request,
-    mock_tool_executor,
-    mock_hooks,
-    streaming,
-):
-    provider = ProviderStatsContextProbe(fail=True)
-    await runner.reset(
-        provider=provider,
-        request=provider_request,
-        run_context=ContextWrapper(context=None),
-        tool_executor=mock_tool_executor,
-        agent_hooks=mock_hooks,
-        streaming=streaming,
-        provider_stats_managed_by_agent=True,
-    )
-
-    with pytest.raises(RuntimeError, match="provider call failed"):
-        async for _ in runner._iter_llm_responses():
-            pass
-
-    assert provider.observed_values == [True]
-    assert provider_module.provider_stats_managed_by_agent.get() is False
 
 
 @pytest.mark.asyncio
@@ -737,6 +659,57 @@ async def test_stats_separate_latest_context_from_cumulative_usage(
     )
     assert runner.stats.current_context_tokens == 220
     assert runner.stats.to_dict()["current_context_tokens"] == 220
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_stats_emit_update_after_each_completed_llm_request(
+    runner, provider_request, mock_tool_executor, mock_hooks, streaming
+):
+    """Emit one stats update for every completed LLM request."""
+    provider = VaryingUsageProvider()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=streaming,
+    )
+
+    responses = [response async for response in runner.step_until_done(3)]
+    stats_responses = [
+        response for response in responses if response.type == "agent_stats"
+    ]
+
+    assert provider.call_count == 2
+    assert len(stats_responses) == 2
+    assert [response.data["chain"].type for response in stats_responses] == [
+        "agent_stats",
+        "agent_stats",
+    ]
+    stats_snapshots = [
+        response.data["chain"].chain[0].data for response in stats_responses
+    ]
+    assert [snapshot["current_context_tokens"] for snapshot in stats_snapshots] == [
+        110,
+        220,
+    ]
+    assert stats_snapshots[0]["token_usage"]["input_other"] == 100
+    assert stats_snapshots[0]["token_usage"]["input_cached"] == 10
+    assert stats_snapshots[1]["token_usage"]["input_other"] == 300
+    assert stats_snapshots[1]["token_usage"]["input_cached"] == 30
+
+    # Emitted events keep their own snapshots even if live stats mutate later.
+    runner.stats.token_usage.input_other = 999
+    assert stats_snapshots[0]["token_usage"]["input_other"] == 100
+    assert stats_snapshots[1]["token_usage"]["input_other"] == 300
+
+    assert responses.index(stats_responses[0]) < next(
+        index
+        for index, response in enumerate(responses)
+        if response.type == "tool_call"
+    )
 
 
 @pytest.mark.asyncio
@@ -1005,7 +978,10 @@ async def test_same_tool_consecutive_results_include_escalating_guidance(
 ):
     runner_cls = type(runner)
     total_calls = runner_cls.REPEATED_TOOL_NOTICE_L3_THRESHOLD
-    provider = SequentialToolProvider(["test_tool"] * total_calls, same_args=True)
+    provider = SequentialToolProvider(
+        ["test_tool"] * total_calls,
+        [{"query": "same"}] * total_calls,
+    )
     tool = FunctionTool(
         name="test_tool",
         description="测试工具",
@@ -1069,7 +1045,7 @@ async def test_same_tool_consecutive_results_include_escalating_guidance(
 
 
 @pytest.mark.asyncio
-async def test_same_tool_streak_resets_when_arguments_change(
+async def test_same_tool_with_different_args_does_not_include_repeated_guidance(
     runner, mock_tool_executor, mock_hooks
 ):
     runner_cls = type(runner)
@@ -1082,7 +1058,7 @@ async def test_same_tool_streak_resets_when_arguments_change(
         handler=AsyncMock(),
     )
     request = ProviderRequest(
-        prompt="请连续执行不同参数的工具",
+        prompt="使用不同参数连续执行工具",
         func_tool=ToolSet(tools=[tool]),
         contexts=[],
     )
@@ -1103,86 +1079,9 @@ async def test_same_tool_streak_resets_when_arguments_change(
         m for m in runner.run_context.messages if getattr(m, "role", None) == "tool"
     ]
     assert len(tool_messages) == total_calls
-
-    tool_contents = [str(message.content) for message in tool_messages]
-    notices = [
-        runner_cls.REPEATED_TOOL_NOTICE_L1_TEMPLATE.format(
-            tool_name="test_tool",
-            streak=runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD,
-        ),
-        runner_cls.REPEATED_TOOL_NOTICE_L2_TEMPLATE.format(
-            tool_name="test_tool",
-            streak=runner_cls.REPEATED_TOOL_NOTICE_L2_THRESHOLD,
-        ),
-        runner_cls.REPEATED_TOOL_NOTICE_L3_TEMPLATE.format(
-            tool_name="test_tool",
-            streak=runner_cls.REPEATED_TOOL_NOTICE_L3_THRESHOLD,
-        ),
-    ]
-    assert all(notice not in content for content in tool_contents for notice in notices)
-
-
-@pytest.mark.asyncio
-async def test_same_tool_streak_treats_none_args_as_empty_dict(
-    runner, mock_tool_executor, mock_hooks
-):
-    runner_cls = type(runner)
-    total_calls = runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD
-
-    class NoneAndEmptyArgsProvider(MockProvider):
-        async def text_chat(self, **kwargs) -> LLMResponse:
-            self.call_count += 1
-            func_tool = kwargs.get("func_tool")
-            if func_tool is None or self.call_count > total_calls:
-                return LLMResponse(
-                    role="assistant",
-                    completion_text="这是我的最终回答",
-                    usage=TokenUsage(input_other=10, output=5),
-                )
-
-            return LLMResponse(
-                role="assistant",
-                completion_text="",
-                tools_call_name=["test_tool"],
-                tools_call_args=[None if self.call_count % 2 else {}],
-                tools_call_ids=[f"call_{self.call_count}"],
-                usage=TokenUsage(input_other=10, output=5),
-            )
-
-    tool = FunctionTool(
-        name="test_tool",
-        description="测试工具",
-        parameters={"type": "object", "properties": {}},
-        handler=AsyncMock(),
+    assert all(
+        "[SYSTEM NOTICE]" not in str(message.content) for message in tool_messages
     )
-    request = ProviderRequest(
-        prompt="请连续执行空参数工具",
-        func_tool=ToolSet(tools=[tool]),
-        contexts=[],
-    )
-
-    await runner.reset(
-        provider=NoneAndEmptyArgsProvider(),
-        request=request,
-        run_context=ContextWrapper(context=None),
-        tool_executor=mock_tool_executor,
-        agent_hooks=mock_hooks,
-        streaming=False,
-    )
-
-    async for _ in runner.step_until_done(total_calls + 1):
-        pass
-
-    tool_messages = [
-        m for m in runner.run_context.messages if getattr(m, "role", None) == "tool"
-    ]
-    assert len(tool_messages) == total_calls
-
-    level_1_notice = runner_cls.REPEATED_TOOL_NOTICE_L1_TEMPLATE.format(
-        tool_name="test_tool",
-        streak=runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD,
-    )
-    assert level_1_notice in str(tool_messages[-1].content)
 
 
 @pytest.mark.asyncio
@@ -1193,7 +1092,7 @@ async def test_same_tool_streak_resets_after_switching_tools(
     repeated_after_reset = runner_cls.REPEATED_TOOL_NOTICE_L1_THRESHOLD
     provider = SequentialToolProvider(
         ["test_tool", "other_tool", *(["test_tool"] * repeated_after_reset)],
-        same_args=True,
+        [{"query": "same"}] * (repeated_after_reset + 2),
     )
     tool_a = FunctionTool(
         name="test_tool",
@@ -1442,6 +1341,8 @@ async def test_stop_interrupts_pending_subagent_handoff(mock_hooks):
 
     step_iter = runner.step()
     first_resp = await step_iter.__anext__()
+    if first_resp.type == "agent_stats":
+        first_resp = await step_iter.__anext__()
     assert first_resp.type == "tool_call"
     assert provider.abort_signal is not None
     assert provider.abort_signal.is_set() is False
@@ -1492,6 +1393,8 @@ async def test_stop_interrupts_pending_regular_tool(mock_hooks):
 
     step_iter = runner.step()
     first_resp = await step_iter.__anext__()
+    if first_resp.type == "agent_stats":
+        first_resp = await step_iter.__anext__()
     assert first_resp.type == "tool_call"
     assert provider.abort_signal is not None
     assert provider.abort_signal.is_set() is False
