@@ -1146,7 +1146,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 if response_usage is not None:
                     total_usage = total_usage + response_usage
                 results.extend(await self._extract_generated_images(response))
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self._record_provider_stat(
                 request_kind="image",
                 status="error",

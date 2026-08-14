@@ -229,6 +229,7 @@ async def test_tool_loop_agent_persists_one_aggregated_provider_stat(
         chat_provider_id="provider-1",
         prompt="test",
         agent_context=SimpleNamespace(),
+        provider_stats_managed_by_agent=False,
     )
 
     records = await get_provider_stats(temp_db)

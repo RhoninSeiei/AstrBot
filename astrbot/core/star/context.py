@@ -332,7 +332,7 @@ class Context:
             for k, v in kwargs.items()
             if k not in ["stream", "agent_hooks", "agent_context"]
         }
-        other_kwargs.setdefault("provider_stats_managed_by_agent", True)
+        other_kwargs["provider_stats_managed_by_agent"] = True
         if request.func_tool and request.func_tool.get_tool("astrbot_file_read_tool"):
             other_kwargs.setdefault(
                 "tool_result_overflow_dir", get_astrbot_system_tmp_path()

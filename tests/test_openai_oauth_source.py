@@ -1546,6 +1546,58 @@ async def test_generate_image_aggregates_usage_into_one_provider_call(
 
 
 @pytest.mark.asyncio
+async def test_generate_image_records_partial_usage_when_cancelled(
+    tmp_path,
+    provider_stat_writer,
+):
+    image_bytes = b"\x89PNG\r\n\x1a\npartial-cancel"
+    second_request_started = asyncio.Event()
+    backend_calls = 0
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+
+    async def fake_request_image_backend(payload: dict):
+        nonlocal backend_calls
+        backend_calls += 1
+        if backend_calls == 1:
+            return {
+                "usage": {
+                    "input_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 2},
+                    "output_tokens": 3,
+                },
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "result": base64.b64encode(image_bytes).decode(),
+                    }
+                ],
+            }
+        second_request_started.set()
+        await asyncio.Event().wait()
+
+    provider._request_image_backend = fake_request_image_backend
+    try:
+        task = asyncio.create_task(provider.generate_image(prompt="draw two icons", n=2))
+        await second_request_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert backend_calls == 2
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["status"] == "error"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 3,
+            "input_cached": 2,
+            "output": 3,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_generate_image_records_backend_failure_and_reraises(
     tmp_path,
     provider_stat_writer,
