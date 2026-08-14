@@ -102,3 +102,20 @@ async def test_provider_token_stats_include_internal_and_provider_records(temp_d
         {"provider_model": "oauth-model", "tokens": 16},
         {"provider_model": "standard-model", "tokens": 8},
     ]
+
+
+@pytest.mark.asyncio
+async def test_aborted_provider_call_is_not_counted_as_success(temp_db):
+    await temp_db.insert_provider_stat(
+        umo="platform:aborted",
+        provider_id="standard",
+        status="aborted",
+        stats={"token_usage": {"output": 1}},
+        agent_type="internal",
+    )
+
+    service = StatService(temp_db, SimpleNamespace(), {})
+    stats = await service.get_provider_token_stats(1)
+
+    assert stats["range_total_calls"] == 1
+    assert stats["range_success_rate"] == 0

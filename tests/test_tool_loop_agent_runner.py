@@ -1670,10 +1670,14 @@ async def test_skills_like_requery_passes_extra_user_content_parts():
     from astrbot.core.agent.message import TextPart
 
     captured_kwargs = {}
+    stats_scope_values = []
 
     class SkillsLikeProvider(MockProvider):
         async def text_chat(self, **kwargs) -> LLMResponse:
             self.call_count += 1
+            stats_scope_values.append(
+                provider_module.provider_stats_managed_by_agent.get()
+            )
             if self.call_count == 1:
                 # 第一次调用：返回工具选择（light schema）
                 return LLMResponse(
@@ -1689,11 +1693,16 @@ async def test_skills_like_requery_passes_extra_user_content_parts():
                 captured_kwargs.update(kwargs)
                 return LLMResponse(
                     role="assistant",
+                    usage=TokenUsage(input_other=20, output=2),
+                )
+            if self.call_count == 3:
+                return LLMResponse(
+                    role="assistant",
                     completion_text="调用工具",
                     tools_call_name=["test_tool"],
                     tools_call_args=[{"query": "actual"}],
                     tools_call_ids=["call_2"],
-                    usage=TokenUsage(input_other=10, output=5),
+                    usage=TokenUsage(input_other=30, output=3),
                 )
             # 后续调用：正常回复
             return LLMResponse(
@@ -1731,6 +1740,7 @@ async def test_skills_like_requery_passes_extra_user_content_parts():
         tool_executor=cast(Any, MockToolExecutor()),
         agent_hooks=MockHooks(),
         tool_schema_mode="skills_like",
+        provider_stats_managed_by_agent=True,
     )
 
     async for _ in runner.step():
@@ -1743,6 +1753,8 @@ async def test_skills_like_requery_passes_extra_user_content_parts():
     parts = captured_kwargs["extra_user_content_parts"]
     assert len(parts) == 1
     assert parts[0].text == "<image_caption>一张猫的照片</image_caption>"
+    assert stats_scope_values == [True, True, True]
+    assert runner.stats.token_usage == TokenUsage(input_other=60, output=10)
 
 
 @pytest.mark.asyncio

@@ -1166,6 +1166,28 @@ async def test_provider_test_records_test_call_without_provider_duplicate(
 
 
 @pytest.mark.asyncio
+async def test_provider_test_timeout_records_one_failed_test_call(
+    monkeypatch,
+    provider_stat_writer,
+):
+    async def slow_text_chat(_self, **kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", slow_text_chat)
+    provider = _make_provider()
+    try:
+        with pytest.raises(TimeoutError):
+            await provider.test(timeout=0.01)
+
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["agent_type"] == "test"
+        assert call["status"] == "error"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_context_llm_generate_uses_agent_stats_without_oauth_duplicate(
     monkeypatch,
     provider_stat_writer,
@@ -1885,5 +1907,52 @@ data: {"type":"response.completed","response":{"id":"resp_test","object":"respon
         assert response["output"][0]["content"][0]["text"] == "PONG"
         assert llm_response.usage is not None
         assert llm_response.usage.output == 6
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_stream_preserves_provider_positional_arguments():
+    provider = _make_provider()
+    provider.text_chat = AsyncMock(
+        return_value=LLMResponse(role="assistant", completion_text="ok")
+    )
+    tool = SimpleNamespace()
+    tool_result = SimpleNamespace()
+    extra_parts = [SimpleNamespace()]
+    try:
+        responses = [
+            response
+            async for response in provider.text_chat_stream(
+                "prompt",
+                "session",
+                ["image"],
+                ["audio"],
+                tool,
+                [{"role": "user", "content": "message"}],
+                "system",
+                tool_result,
+                "model",
+                "required",
+                2,
+                extra_user_content_parts=extra_parts,
+            )
+        ]
+
+        assert len(responses) == 1
+        provider.text_chat.assert_awaited_once_with(
+            prompt="prompt",
+            session_id="session",
+            image_urls=["image"],
+            audio_urls=["audio"],
+            func_tool=tool,
+            contexts=[{"role": "user", "content": "message"}],
+            system_prompt="system",
+            tool_calls_result=tool_result,
+            model="model",
+            extra_user_content_parts=extra_parts,
+            tool_choice="required",
+            request_max_retries=2,
+        )
     finally:
         await provider.terminate()
