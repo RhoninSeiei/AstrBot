@@ -1261,14 +1261,16 @@ async def test_fallback_provider_used_when_primary_raises(
 
 
 @pytest.mark.asyncio
-async def test_fallback_preserves_usage_from_failed_primary_response(
+async def test_fallback_tracks_failed_primary_usage_by_provider(
     runner,
     provider_request,
     mock_tool_executor,
     mock_hooks,
 ):
     primary_provider = MockUsageFailingProvider()
+    primary_provider.provider_config["id"] = "primary"
     fallback_provider = MockProvider()
+    fallback_provider.provider_config["id"] = "fallback"
     fallback_provider.should_call_tools = False
 
     await runner.reset(
@@ -1289,6 +1291,10 @@ async def test_fallback_preserves_usage_from_failed_primary_response(
         input_cached=4,
         output=11,
     )
+    assert len(runner.provider_stat_segments) == 1
+    segment = runner.provider_stat_segments[0]
+    assert segment.provider is primary_provider
+    assert segment.usage == TokenUsage(input_other=8, input_cached=4, output=6)
 
 
 @pytest.mark.asyncio
