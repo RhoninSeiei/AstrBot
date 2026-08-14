@@ -5,6 +5,7 @@ import mimetypes
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,10 @@ from .request_retry import retry_provider_request
 
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
 CODEX_CLIENT_VERSION = "0.144.0"
+oauth_provider_stat_kind: ContextVar[str] = ContextVar(
+    "oauth_provider_stat_kind",
+    default="text",
+)
 
 
 @dataclass
@@ -722,7 +727,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                     "end_time": end_time,
                     "time_to_first_token": 0.0,
                 },
-                agent_type="provider",
+                agent_type="test" if request_kind == "test" else "provider",
             )
         except Exception:
             logger.warning(
@@ -922,6 +927,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             Exception: Re-raises the original provider exception unchanged.
         """
         managed_by_agent = provider_stats_managed_by_agent.get()
+        request_kind = oauth_provider_stat_kind.get()
         start_time = time.time()
         try:
             response = await super().text_chat(
@@ -939,12 +945,12 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 request_max_retries=request_max_retries,
                 **kwargs,
             )
-        except Exception:
+        except Exception as exc:
             if not managed_by_agent:
                 await self._record_provider_stat(
-                    request_kind="text",
+                    request_kind=request_kind,
                     status="error",
-                    usage=None,
+                    usage=getattr(exc, "_astrbot_token_usage", None),
                     start_time=start_time,
                     end_time=time.time(),
                     model=model,
@@ -954,7 +960,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
 
         if not managed_by_agent:
             await self._record_provider_stat(
-                request_kind="text",
+                request_kind=request_kind,
                 status="error" if response.role == "err" else "completed",
                 usage=response.usage,
                 start_time=start_time,
@@ -963,6 +969,13 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 session_id=session_id,
             )
         return response
+
+    async def test(self, timeout: float = 45.0) -> None:
+        token = oauth_provider_stat_kind.set("test")
+        try:
+            await super().test(timeout)
+        finally:
+            oauth_provider_stat_kind.reset(token)
 
     async def _query(
         self,
@@ -1045,7 +1058,17 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             lambda: self._request_backend(params),
             max_attempts=request_max_retries,
         )
-        return await self._parse_responses_completion(response, tools)
+        try:
+            return await self._parse_responses_completion(response, tools)
+        except Exception as exc:
+            usage = self._extract_response_usage(
+                response.get("usage")
+                if isinstance(response, dict)
+                else getattr(response, "usage", None)
+            )
+            if usage is not None:
+                setattr(exc, "_astrbot_token_usage", usage)
+            raise
 
     async def generate_image(
         self,

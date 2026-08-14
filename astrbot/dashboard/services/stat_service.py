@@ -299,7 +299,9 @@ class StatService:
                 result = await session.execute(
                     select(ProviderStat)
                     .where(
-                        col(ProviderStat.agent_type).in_(("internal", "provider")),
+                        col(ProviderStat.agent_type).in_(
+                            ("internal", "provider", "test")
+                        ),
                         ProviderStat.created_at >= query_start_utc,
                     )
                     .order_by(col(ProviderStat.created_at).asc())
@@ -330,6 +332,11 @@ class StatService:
             today_by_provider: dict[str, int] = defaultdict(int)
             today_total_tokens = 0
             today_total_calls = 0
+            stat_categories = ("agent", "provider", "test")
+            range_call_counts = {category: 0 for category in stat_categories}
+            range_token_totals = {category: 0 for category in stat_categories}
+            today_call_counts = {category: 0 for category in stat_categories}
+            today_token_totals = {category: 0 for category in stat_categories}
 
             for record in records:
                 created_at_utc = self._ensure_aware_utc(record.created_at)
@@ -341,6 +348,9 @@ class StatService:
                 )
                 provider_id = record.provider_id or "unknown"
                 provider_model = record.provider_model or "Unknown"
+                stat_category = (
+                    "agent" if record.agent_type == "internal" else record.agent_type
+                )
 
                 if created_at_local >= range_start_local:
                     bucket_local = created_at_local.replace(
@@ -353,6 +363,8 @@ class StatService:
                     total_by_bucket[bucket_ts] += token_total
                     range_total_tokens += token_total
                     range_total_calls += 1
+                    range_call_counts[stat_category] += 1
+                    range_token_totals[stat_category] += token_total
                     if record.status != "error":
                         range_success_calls += 1
                     if record.time_to_first_token > 0:
@@ -368,6 +380,8 @@ class StatService:
                 if created_at_local >= today_start_local:
                     today_total_calls += 1
                     today_total_tokens += token_total
+                    today_call_counts[stat_category] += 1
+                    today_token_totals[stat_category] += token_total
                     today_by_model[provider_model] += token_total
                     today_by_provider[provider_id] += token_total
 
@@ -435,6 +449,8 @@ class StatService:
                 },
                 "range_total_tokens": range_total_tokens,
                 "range_total_calls": range_total_calls,
+                "range_call_counts": range_call_counts,
+                "range_token_totals": range_token_totals,
                 "range_avg_ttft_ms": (
                     range_ttft_total_ms / range_ttft_samples
                     if range_ttft_samples
@@ -457,6 +473,8 @@ class StatService:
                 "range_by_umo": range_by_umo_data,
                 "today_total_tokens": today_total_tokens,
                 "today_total_calls": today_total_calls,
+                "today_call_counts": today_call_counts,
+                "today_token_totals": today_token_totals,
                 "today_by_model": today_by_model_data,
                 "today_by_provider": today_by_provider_data,
             }

@@ -133,6 +133,13 @@
               <div class="card-label">{{ t('modelTotal.title', { range: rangeLabel }) }}</div>
               <div class="token-total-value">{{ formatNumber(providerStats?.range_total_tokens ?? 0) }} <span style="font-size: 18px;">{{ t('units.tokens') }}</span></div>
               <div class="card-note">{{ t('modelTotal.callCount', { count: formatNumber(providerStats?.range_total_calls ?? 0) }) }}</div>
+              <div class="card-note call-breakdown">
+                {{ t('modelTotal.callBreakdown', {
+                  agent: formatNumber(providerStats?.range_call_counts?.agent ?? 0),
+                  provider: formatNumber(providerStats?.range_call_counts?.provider ?? 0),
+                  test: formatNumber(providerStats?.range_call_counts?.test ?? 0)
+                }) }}
+              </div>
               <div class="token-meta-list">
                 <div class="token-meta-item">
                   <span>{{ t('modelTotal.avgTtft') }}</span>
@@ -264,6 +271,16 @@ interface ProviderTokenStatsResponse {
   }
   range_total_tokens: number
   range_total_calls: number
+  range_call_counts: {
+    agent: number
+    provider: number
+    test: number
+  }
+  range_token_totals: {
+    agent: number
+    provider: number
+    test: number
+  }
   range_avg_ttft_ms: number
   range_avg_duration_ms: number
   range_avg_tpm: number
@@ -857,6 +874,10 @@ onBeforeUnmount(() => {
   color: var(--stats-subtle);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.call-breakdown {
+  margin-top: 2px;
 }
 
 .chart-card,
