@@ -2,7 +2,7 @@
 import MarketPluginCard from "@/components/extension/MarketPluginCard.vue";
 import PluginSortControl from "@/components/extension/PluginSortControl.vue";
 import PluginPlatformChip from "@/components/shared/PluginPlatformChip.vue";
-import defaultPluginIcon from "@/assets/images/plugin_icon.png";
+import defaultPluginIcon from "/favicon.svg";
 import { computed } from "vue";
 import { normalizeTextInput } from "@/utils/inputValue";
 
@@ -167,6 +167,7 @@ const currentSourceName = computed(() => {
 const marketSortItems = computed(() => [
   { title: tm("sort.default"), value: "default" },
   { title: tm("sort.stars"), value: "stars" },
+  { title: tm("sort.downloads"), value: "downloads" },
   { title: tm("sort.author"), value: "author" },
   { title: tm("sort.updated"), value: "updated" },
 ]);
