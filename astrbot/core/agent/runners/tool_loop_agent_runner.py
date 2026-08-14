@@ -39,6 +39,7 @@ from astrbot.core.persona_error_reply import (
 from astrbot.core.provider.entities import (
     LLMResponse,
     ProviderRequest,
+    TokenUsage,
     ToolCallsResult,
 )
 from astrbot.core.provider.modalities import (
@@ -627,6 +628,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if isinstance(failed_usage, TokenUsage):
+                    self.stats.token_usage += failed_usage
                 logger.warning(
                     "Chat Model %s request error: %s",
                     candidate_id,

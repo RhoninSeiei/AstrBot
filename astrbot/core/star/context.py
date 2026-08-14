@@ -209,6 +209,7 @@ class Context:
             raise ProviderNotFoundError(f"Provider {chat_provider_id} not found")
         start_time = time.time()
         llm_resp = None
+        failed_usage = None
         stats_token = provider_stats_managed_by_agent.set(True)
         try:
             try:
@@ -221,6 +222,9 @@ class Context:
                     system_prompt=system_prompt,
                     **kwargs,
                 )
+            except Exception as exc:
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                raise
             finally:
                 provider_stats_managed_by_agent.reset(stats_token)
         finally:
@@ -233,6 +237,7 @@ class Context:
                 start_time=start_time,
                 end_time=time.time(),
                 conversation_id=kwargs.get("conversation_id"),
+                usage=failed_usage,
             )
         return llm_resp
 
