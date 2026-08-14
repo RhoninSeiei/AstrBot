@@ -353,16 +353,19 @@ class Context:
             streaming=streaming,
             **other_kwargs,
         )
-        async for _ in agent_runner.step_until_done(max_steps):
-            pass
-        llm_resp = agent_runner.get_final_llm_resp()
-        await record_agent_runner_stats(
-            self._db,
-            umo=event.unified_msg_origin,
-            request=request,
-            agent_runner=agent_runner,
-            final_response=llm_resp,
-        )
+        llm_resp = None
+        try:
+            async for _ in agent_runner.step_until_done(max_steps):
+                pass
+            llm_resp = agent_runner.get_final_llm_resp()
+        finally:
+            await record_agent_runner_stats(
+                self._db,
+                umo=event.unified_msg_origin,
+                request=request,
+                agent_runner=agent_runner,
+                final_response=llm_resp,
+            )
         if not llm_resp:
             raise Exception("Agent did not produce a final LLM response")
         return llm_resp
