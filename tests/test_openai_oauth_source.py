@@ -18,6 +18,7 @@ from astrbot.core.provider.oauth.openai_oauth_shared_state import (
 )
 from astrbot.core.provider.sources.openai_oauth_source import ProviderOpenAIOAuth
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
+from astrbot.core.star.context import Context
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -1094,6 +1095,102 @@ async def test_text_chat_records_exception_once_and_reraises(
         assert raised.value is expected_error
         provider_stat_writer.assert_awaited_once()
         assert provider_stat_writer.await_args.kwargs["status"] == "error"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_records_backend_usage_when_response_parsing_fails(
+    provider_stat_writer,
+):
+    provider = _make_provider()
+
+    async def fake_request_backend(payload: dict):
+        return {
+            "id": "resp-unparseable",
+            "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens": 6,
+            },
+            "output": [],
+        }
+
+    provider._request_backend = fake_request_backend
+    try:
+        with pytest.raises(Exception):
+            await provider.text_chat(prompt="ping")
+
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["status"] == "error"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 8,
+            "input_cached": 4,
+            "output": 6,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_provider_test_records_test_call_without_provider_duplicate(
+    monkeypatch,
+    provider_stat_writer,
+):
+    async def fake_text_chat(_self, **kwargs):
+        return LLMResponse(
+            role="assistant",
+            completion_text="pong",
+            usage=TokenUsage(input_other=2, input_cached=1, output=1),
+        )
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    try:
+        await provider.test()
+
+        provider_stat_writer.assert_awaited_once()
+        call = provider_stat_writer.await_args.kwargs
+        assert call["umo"] == "provider:test-openai-oauth:test"
+        assert call["agent_type"] == "test"
+        assert call["stats"]["token_usage"] == {
+            "input_other": 2,
+            "input_cached": 1,
+            "output": 1,
+        }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_llm_generate_uses_agent_stats_without_oauth_duplicate(
+    monkeypatch,
+    provider_stat_writer,
+    temp_db,
+):
+    async def fake_text_chat(_self, **kwargs):
+        return LLMResponse(
+            role="assistant",
+            completion_text="pong",
+            usage=TokenUsage(input_other=3, input_cached=2, output=4),
+        )
+
+    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
+    provider = _make_provider()
+    context = Context.__new__(Context)
+    context._db = temp_db
+    context.provider_manager = SimpleNamespace(
+        get_provider_by_id=AsyncMock(return_value=provider),
+    )
+    try:
+        await context.llm_generate(
+            chat_provider_id="test-openai-oauth",
+            prompt="ping",
+            session_id="session-1",
+        )
+
+        provider_stat_writer.assert_not_awaited()
     finally:
         await provider.terminate()
 

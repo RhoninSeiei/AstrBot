@@ -188,6 +188,7 @@ async def test_tool_loop_agent_persists_one_aggregated_provider_stat(
         completion_text="done",
         usage=TokenUsage(input_other=8, input_cached=1, output=4),
     )
+    reset_calls = []
 
     class FakeRunner:
         def __init__(self) -> None:
@@ -200,7 +201,7 @@ async def test_tool_loop_agent_persists_one_aggregated_provider_stat(
             )
 
         async def reset(self, **kwargs) -> None:
-            return None
+            reset_calls.append(kwargs)
 
         async def step_until_done(self, max_steps):
             if False:
@@ -242,3 +243,4 @@ async def test_tool_loop_agent_persists_one_aggregated_provider_stat(
     assert record.token_output == 7
     assert record.start_time == 100.0
     assert record.end_time == 106.0
+    assert reset_calls[0]["provider_stats_managed_by_agent"] is True

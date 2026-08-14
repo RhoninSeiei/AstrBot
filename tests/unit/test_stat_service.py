@@ -58,20 +58,47 @@ async def test_provider_token_stats_include_internal_and_provider_records(temp_d
         },
         agent_type="third_party",
     )
+    await temp_db.insert_provider_stat(
+        umo="provider:oauth:test",
+        provider_id="oauth",
+        provider_model="oauth-model",
+        status="completed",
+        stats={
+            "token_usage": {
+                "input_other": 1,
+                "input_cached": 0,
+                "output": 2,
+            },
+            "start_time": 7.0,
+            "end_time": 8.0,
+            "time_to_first_token": 0.0,
+        },
+        agent_type="test",
+    )
 
     service = StatService(temp_db, SimpleNamespace(), {})
     stats = await service.get_provider_token_stats(1)
 
-    assert stats["range_total_calls"] == 2
-    assert stats["range_total_tokens"] == 21
-    assert stats["range_success_rate"] == 0.5
-    assert stats["today_total_calls"] == 2
-    assert stats["today_total_tokens"] == 21
+    assert stats["range_total_calls"] == 3
+    assert stats["range_total_tokens"] == 24
+    assert stats["range_success_rate"] == pytest.approx(2 / 3)
+    assert stats["range_call_counts"] == {
+        "agent": 1,
+        "provider": 1,
+        "test": 1,
+    }
+    assert stats["range_token_totals"] == {
+        "agent": 8,
+        "provider": 13,
+        "test": 3,
+    }
+    assert stats["today_total_calls"] == 3
+    assert stats["today_total_tokens"] == 24
     assert stats["range_by_provider"] == [
-        {"provider_id": "oauth", "tokens": 13},
+        {"provider_id": "oauth", "tokens": 16},
         {"provider_id": "standard", "tokens": 8},
     ]
     assert stats["today_by_model"] == [
-        {"provider_model": "oauth-model", "tokens": 13},
+        {"provider_model": "oauth-model", "tokens": 16},
         {"provider_model": "standard-model", "tokens": 8},
     ]
