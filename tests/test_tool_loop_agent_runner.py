@@ -184,6 +184,18 @@ class MockFailingProvider(MockProvider):
         raise RuntimeError("primary provider failed")
 
 
+class MockUsageFailingProvider(MockProvider):
+    async def text_chat(self, **kwargs) -> LLMResponse:
+        self.call_count += 1
+        error = RuntimeError("primary response parsing failed")
+        error._astrbot_token_usage = TokenUsage(  # type: ignore[attr-defined]
+            input_other=8,
+            input_cached=4,
+            output=6,
+        )
+        raise error
+
+
 class MockErrProvider(MockProvider):
     async def text_chat(self, **kwargs) -> LLMResponse:
         self.call_count += 1
@@ -1246,6 +1258,37 @@ async def test_fallback_provider_used_when_primary_raises(
     assert final_resp.completion_text == "这是我的最终回答"
     assert primary_provider.call_count == 1
     assert fallback_provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_preserves_usage_from_failed_primary_response(
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+):
+    primary_provider = MockUsageFailingProvider()
+    fallback_provider = MockProvider()
+    fallback_provider.should_call_tools = False
+
+    await runner.reset(
+        provider=primary_provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+        fallback_providers=[fallback_provider],
+    )
+
+    async for _ in runner.step_until_done(5):
+        pass
+
+    assert runner.stats.token_usage == TokenUsage(
+        input_other=18,
+        input_cached=4,
+        output=11,
+    )
 
 
 @pytest.mark.asyncio

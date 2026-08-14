@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlmodel import select
 
 import astrbot.core.provider.provider as provider_module
 import astrbot.core.provider.sources.openai_oauth_source as oauth_source
+from astrbot.core.db.po import ProviderStat
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.oauth.openai_oauth import parse_oauth_credential_json
@@ -1191,6 +1193,52 @@ async def test_context_llm_generate_uses_agent_stats_without_oauth_duplicate(
         )
 
         provider_stat_writer.assert_not_awaited()
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_llm_generate_preserves_oauth_usage_on_parse_failure(
+    provider_stat_writer,
+    temp_db,
+):
+    provider = _make_provider()
+
+    async def fake_request_backend(payload: dict):
+        return {
+            "id": "resp-unparseable",
+            "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens": 6,
+            },
+            "output": [],
+        }
+
+    provider._request_backend = fake_request_backend
+    context = Context.__new__(Context)
+    context._db = temp_db
+    context.provider_manager = SimpleNamespace(
+        get_provider_by_id=AsyncMock(return_value=provider),
+    )
+    try:
+        with pytest.raises(Exception):
+            await context.llm_generate(
+                chat_provider_id="test-openai-oauth",
+                prompt="ping",
+                session_id="session-1",
+            )
+
+        provider_stat_writer.assert_not_awaited()
+        async with temp_db.get_db() as session:
+            result = await session.execute(select(ProviderStat))
+            records = result.scalars().all()
+
+        assert len(records) == 1
+        assert records[0].status == "error"
+        assert records[0].token_input_other == 8
+        assert records[0].token_input_cached == 4
+        assert records[0].token_output == 6
     finally:
         await provider.terminate()
 
