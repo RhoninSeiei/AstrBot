@@ -229,15 +229,19 @@ class Context:
                 provider_stats_managed_by_agent.reset(stats_token)
         finally:
             session_id = kwargs.get("session_id") or "sdk"
+            provider_id = str(
+                getattr(prov, "provider_config", {}).get("id") or "unknown"
+            )
             await record_llm_response_stats(
                 self._db,
-                umo=f"provider:{prov.meta().id}:{session_id}",
+                umo=f"provider:{provider_id}:{session_id}",
                 provider=prov,
                 response=llm_resp,
                 start_time=start_time,
                 end_time=time.time(),
                 conversation_id=kwargs.get("conversation_id"),
                 usage=failed_usage,
+                agent_type="provider",
             )
         return llm_resp
 

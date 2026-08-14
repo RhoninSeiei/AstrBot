@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import inspect
 import json
@@ -710,8 +711,8 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             model: Explicit request model when supplied.
             session_id: Session identifier when supplied by the caller.
         """
-        provider_id = str(self.provider_config.get("id") or self.meta().id)
         try:
+            provider_id = str(self.provider_config.get("id") or self.meta().id)
             await db_helper.insert_provider_stat(
                 umo=session_id or f"provider:{provider_id}:{request_kind}",
                 provider_id=provider_id,
@@ -945,6 +946,18 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                 request_max_retries=request_max_retries,
                 **kwargs,
             )
+        except asyncio.CancelledError:
+            if not managed_by_agent:
+                await self._record_provider_stat(
+                    request_kind=request_kind,
+                    status="error",
+                    usage=None,
+                    start_time=start_time,
+                    end_time=time.time(),
+                    model=model,
+                    session_id=session_id,
+                )
+            raise
         except Exception as exc:
             if not managed_by_agent:
                 await self._record_provider_stat(
@@ -1275,23 +1288,29 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         prompt=None,
         session_id=None,
         image_urls=None,
+        audio_urls=None,
         func_tool=None,
         contexts=None,
         system_prompt=None,
         tool_calls_result=None,
         model=None,
-        extra_user_content_parts=None,
+        tool_choice="auto",
+        request_max_retries=None,
         **kwargs,
     ) -> AsyncGenerator[LLMResponse, None]:
+        extra_user_content_parts = kwargs.pop("extra_user_content_parts", None)
         yield await self.text_chat(
             prompt=prompt,
             session_id=session_id,
             image_urls=image_urls,
+            audio_urls=audio_urls,
             func_tool=func_tool,
             contexts=contexts,
             system_prompt=system_prompt,
             tool_calls_result=tool_calls_result,
             model=model,
             extra_user_content_parts=extra_user_content_parts,
+            tool_choice=tool_choice,
+            request_max_retries=request_max_retries,
             **kwargs,
         )

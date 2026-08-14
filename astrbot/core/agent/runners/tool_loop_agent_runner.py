@@ -471,6 +471,30 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         finally:
             provider_stats_managed_by_agent.reset(token)
 
+    def _accumulate_token_usage(self, usage: TokenUsage | None) -> None:
+        if usage is None:
+            return
+        self.stats.token_usage += usage
+        self.stats.current_context_tokens = usage.input
+        if self.req and self.req.conversation:
+            self.req.conversation.token_usage = usage.total
+
+    async def _await_additional_provider_response(
+        self,
+        awaitable: T.Awaitable[LLMResponse],
+    ) -> LLMResponse | None:
+        with self._provider_stats_scope():
+            try:
+                response = await self._await_or_stop(awaitable)
+            except Exception as exc:
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if isinstance(failed_usage, TokenUsage):
+                    self._accumulate_token_usage(failed_usage)
+                raise
+        if response is not None:
+            self._accumulate_token_usage(response.usage)
+        return response
+
     async def _await_or_stop(
         self,
         awaitable: T.Awaitable[AwaitableResultT],
@@ -1432,7 +1456,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
-                requery_resp = await self._await_or_stop(
+                requery_resp = await self._await_additional_provider_response(
                     self.provider.text_chat(
                         contexts=self._sanitize_contexts_for_provider(contexts),
                         func_tool=param_subset,
@@ -1462,7 +1486,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
-                    repair_resp = await self._await_or_stop(
+                    repair_resp = await self._await_additional_provider_response(
                         self.provider.text_chat(
                             contexts=self._sanitize_contexts_for_provider(
                                 repair_contexts

@@ -263,6 +263,11 @@ interface UmoRankingItem {
   tokens: number
 }
 
+interface ModelRankingItem {
+  provider_model: string
+  tokens: number
+}
+
 interface ProviderTokenStatsResponse {
   days: TokenRange
   trend: {
@@ -289,6 +294,17 @@ interface ProviderTokenStatsResponse {
   range_by_umo: UmoRankingItem[]
   today_total_tokens: number
   today_total_calls: number
+  today_call_counts: {
+    agent: number
+    provider: number
+    test: number
+  }
+  today_token_totals: {
+    agent: number
+    provider: number
+    test: number
+  }
+  today_by_model: ModelRankingItem[]
   today_by_provider: ProviderRankingItem[]
 }
 

@@ -365,7 +365,7 @@ class StatService:
                     range_total_calls += 1
                     range_call_counts[stat_category] += 1
                     range_token_totals[stat_category] += token_total
-                    if record.status != "error":
+                    if record.status == "completed":
                         range_success_calls += 1
                     if record.time_to_first_token > 0:
                         range_ttft_total_ms += record.time_to_first_token * 1000
