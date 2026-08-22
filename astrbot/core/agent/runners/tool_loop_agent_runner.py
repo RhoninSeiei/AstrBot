@@ -625,6 +625,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     and (not is_last_candidate)
                                 ):
                                     last_err_response = resp
+                                    last_exception = None
                                     failed_usage = resp.usage or TokenUsage()
                                     self.stats.token_usage += failed_usage
                                     self.provider_stat_segments.append(
@@ -665,6 +666,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
+                last_err_response = None
                 failed_usage = getattr(exc, "_astrbot_token_usage", None)
                 if not isinstance(failed_usage, TokenUsage):
                     failed_usage = TokenUsage()

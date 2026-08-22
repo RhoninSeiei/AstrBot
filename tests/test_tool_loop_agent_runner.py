@@ -196,6 +196,16 @@ class MockUsageFailingProvider(MockProvider):
         raise error
 
 
+class MockUsageErrProvider(MockProvider):
+    async def text_chat(self, **kwargs) -> LLMResponse:
+        self.call_count += 1
+        return LLMResponse(
+            role="err",
+            completion_text="provider returned error",
+            usage=TokenUsage(input_other=3, input_cached=2, output=1),
+        )
+
+
 class MockErrProvider(MockProvider):
     async def text_chat(self, **kwargs) -> LLMResponse:
         self.call_count += 1
@@ -1336,6 +1346,44 @@ async def test_fallback_provider_used_when_primary_returns_err(
     assert segment.provider is primary_provider
     assert segment.usage == TokenUsage()
     assert segment.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_fallback_consecutive_failures_do_not_duplicate_prior_usage(
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+):
+    primary_provider = MockUsageErrProvider()
+    fallback_provider = MockUsageFailingProvider()
+
+    await runner.reset(
+        provider=primary_provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+        fallback_providers=[fallback_provider],
+    )
+
+    async for _ in runner.step_until_done(5):
+        pass
+
+    final_resp = runner.get_final_llm_resp()
+    assert final_resp is not None
+    assert final_resp.role == "err"
+    assert "RuntimeError" in final_resp.completion_text
+    assert runner.stats.token_usage == TokenUsage(
+        input_other=11,
+        input_cached=6,
+        output=7,
+    )
+    assert len(runner.provider_stat_segments) == 1
+    segment = runner.provider_stat_segments[0]
+    assert segment.provider is primary_provider
+    assert segment.usage == TokenUsage(input_other=3, input_cached=2, output=1)
 
 
 @pytest.mark.asyncio
