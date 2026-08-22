@@ -64,7 +64,9 @@ async def test_source_upsert_waits_for_shared_refresh_lock():
         "auth_mode": "manual",
     }
 
-    with patch.object(config_service_module, "save_config", lambda *_args, **_kwargs: None):
+    with patch.object(
+        config_service_module, "save_config", lambda *_args, **_kwargs: None
+    ):
         async with state.refresh_lock:
             task = asyncio.create_task(
                 service.upsert_provider_source("openai_oauth", replacement)
@@ -75,6 +77,37 @@ async def test_source_upsert_waits_for_shared_refresh_lock():
 
     assert state.snapshot()["oauth_refresh_token"] == ""
     assert "openai_oauth" not in manager._openai_oauth_shared_states
+    assert reloads == ["openai_oauth/gpt-5.6-sol"]
+
+
+@pytest.mark.asyncio
+async def test_source_upsert_preserves_credentials_rotated_after_editor_loaded():
+    service, manager, reloads = _build_service()
+    stale_editor_copy = service.get_provider_source("openai_oauth")["provider_source"]
+    state = manager.get_openai_oauth_shared_state(
+        "openai_oauth",
+        service.config["provider_sources"][0],
+    )
+    rotated_credentials = {
+        "oauth_access_token": "access-1",
+        "oauth_refresh_token": "refresh-1",
+        "oauth_expires_at": "2026-07-23T16:58:10+00:00",
+    }
+    stale_editor_copy["http_proxy"] = "http://127.0.0.1:7890"
+
+    with patch.object(
+        config_service_module, "save_config", lambda *_args, **_kwargs: None
+    ):
+        state.apply(rotated_credentials)
+        service.config["provider_sources"][0].update(rotated_credentials)
+        await service.upsert_provider_source("openai_oauth", stale_editor_copy)
+
+    persisted = service.get_provider_source("openai_oauth")["provider_source"]
+    assert persisted["oauth_access_token"] == "access-1"
+    assert persisted["oauth_refresh_token"] == "refresh-1"
+    assert persisted["oauth_expires_at"] == "2026-07-23T16:58:10+00:00"
+    assert persisted["http_proxy"] == "http://127.0.0.1:7890"
+    assert state.snapshot()["oauth_refresh_token"] == "refresh-1"
     assert reloads == ["openai_oauth/gpt-5.6-sol"]
 
 
@@ -94,7 +127,9 @@ async def test_oauth_binding_and_disconnect_wait_for_shared_refresh_lock():
         }
     )
 
-    with patch.object(config_service_module, "save_config", lambda *_args, **_kwargs: None):
+    with patch.object(
+        config_service_module, "save_config", lambda *_args, **_kwargs: None
+    ):
         async with state.refresh_lock:
             bind_task = asyncio.create_task(
                 service.complete_provider_source_openai_oauth(

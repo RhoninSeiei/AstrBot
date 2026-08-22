@@ -1435,8 +1435,15 @@ class ProviderConfigService:
         async with self._openai_oauth_runtime_source_guard(
             source_id,
             current_source,
-        ):
-            await self._upsert_provider_source_unlocked(source_id, config)
+        ) as shared_state:
+            next_config = copy.deepcopy(config)
+            if (
+                shared_state is not None
+                and self._is_openai_oauth_supported_source(next_config)
+                and next_config.get("auth_mode") == "openai_oauth"
+            ):
+                next_config.update(shared_state.snapshot())
+            await self._upsert_provider_source_unlocked(source_id, next_config)
 
     async def _upsert_provider_source_unlocked(
         self,

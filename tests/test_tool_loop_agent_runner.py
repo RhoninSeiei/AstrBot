@@ -1259,6 +1259,12 @@ async def test_fallback_provider_used_when_primary_raises(
     assert primary_provider.call_count == 1
     assert fallback_provider.call_count == 1
 
+    assert len(runner.provider_stat_segments) == 1
+    segment = runner.provider_stat_segments[0]
+    assert segment.provider is primary_provider
+    assert segment.usage == TokenUsage()
+    assert segment.status == "error"
+
 
 @pytest.mark.asyncio
 async def test_fallback_tracks_failed_primary_usage_by_provider(
@@ -1324,6 +1330,12 @@ async def test_fallback_provider_used_when_primary_returns_err(
     assert final_resp.completion_text == "这是我的最终回答"
     assert primary_provider.call_count == 1
     assert fallback_provider.call_count == 1
+
+    assert len(runner.provider_stat_segments) == 1
+    segment = runner.provider_stat_segments[0]
+    assert segment.provider is primary_provider
+    assert segment.usage == TokenUsage()
+    assert segment.status == "error"
 
 
 @pytest.mark.asyncio
