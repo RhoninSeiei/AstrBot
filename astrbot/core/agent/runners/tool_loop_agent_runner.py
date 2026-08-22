@@ -5,7 +5,7 @@ import time
 import traceback
 import typing as T
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -39,13 +39,15 @@ from astrbot.core.persona_error_reply import (
 from astrbot.core.provider.entities import (
     LLMResponse,
     ProviderRequest,
+    TokenUsage,
     ToolCallsResult,
 )
 from astrbot.core.provider.modalities import (
     log_context_sanitize_stats,
     sanitize_contexts_by_modalities,
 )
-from astrbot.core.provider.provider import Provider
+from astrbot.core.provider.provider import Provider, provider_stats_managed_by_agent
+from astrbot.core.provider.stats import ProviderStatSegment
 
 from ..context.compressor import ContextCompressor
 from ..context.config import ContextConfig
@@ -227,6 +229,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         tool_schema_mode: str | None = "full",
         fallback_providers: list[Provider] | None = None,
         request_max_retries: int | None = None,
+        provider_stats_managed_by_agent: bool = False,
         tool_result_overflow_dir: str | None = None,
         read_tool: FunctionTool | None = None,
         **kwargs: T.Any,
@@ -241,6 +244,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.custom_token_counter = custom_token_counter
         self.custom_compressor = custom_compressor
         self.request_max_retries = request_max_retries
+        self.provider_stats_managed_by_agent = provider_stats_managed_by_agent
         self.tool_result_overflow_dir = tool_result_overflow_dir
         self.read_tool = read_tool
         self._tool_result_token_counter = EstimateTokenCounter()
@@ -324,6 +328,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         self.stats = AgentStats()
         self.stats.start_time = time.time()
+        self.provider_stat_segments: list[ProviderStatSegment] = []
 
     def _read_tool_hint(self) -> str:
         if self.read_tool is not None:
@@ -458,6 +463,40 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             preview = preview[:next_len]
         return preview
 
+    @contextmanager
+    def _provider_stats_scope(self) -> T.Iterator[None]:
+        token = provider_stats_managed_by_agent.set(
+            self.provider_stats_managed_by_agent
+        )
+        try:
+            yield
+        finally:
+            provider_stats_managed_by_agent.reset(token)
+
+    def _accumulate_token_usage(self, usage: TokenUsage | None) -> None:
+        if usage is None:
+            return
+        self.stats.token_usage += usage
+        self.stats.current_context_tokens = usage.input
+        if self.req and self.req.conversation:
+            self.req.conversation.token_usage = usage.total
+
+    async def _await_additional_provider_response(
+        self,
+        awaitable: T.Awaitable[LLMResponse],
+    ) -> LLMResponse | None:
+        with self._provider_stats_scope():
+            try:
+                response = await self._await_or_stop(awaitable)
+            except Exception as exc:
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if isinstance(failed_usage, TokenUsage):
+                    self._accumulate_token_usage(failed_usage)
+                raise
+        if response is not None:
+            self._accumulate_token_usage(response.usage)
+        return response
+
     async def _await_or_stop(
         self,
         awaitable: T.Awaitable[AwaitableResultT],
@@ -517,7 +556,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             try:
                 while True:
                     try:
-                        resp = await self._await_or_stop(anext(stream))  # type: ignore
+                        with self._provider_stats_scope():
+                            resp = await self._await_or_stop(anext(stream))  # type: ignore
                     except StopAsyncIteration:
                         return
                     if resp is None:
@@ -526,7 +566,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             finally:
                 await self._close_executor(stream)
         else:
-            resp = await self._await_or_stop(self.provider.text_chat(**payload))
+            with self._provider_stats_scope():
+                resp = await self._await_or_stop(self.provider.text_chat(**payload))
             if resp is not None:
                 yield resp
 
@@ -551,6 +592,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     candidate_id,
                 )
             self.provider = candidate
+            candidate_start_time = time.time()
             try:
                 retrying = AsyncRetrying(
                     retry=retry_if_exception_type(EmptyModelOutputError),
@@ -583,6 +625,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     and (not is_last_candidate)
                                 ):
                                     last_err_response = resp
+                                    if resp.usage is not None:
+                                        self.stats.token_usage += resp.usage
+                                        self.provider_stat_segments.append(
+                                            ProviderStatSegment(
+                                                provider=candidate,
+                                                usage=resp.usage,
+                                                start_time=candidate_start_time,
+                                                end_time=time.time(),
+                                            )
+                                        )
                                     logger.warning(
                                         "Chat Model %s returns error response, trying fallback to next provider.",
                                         candidate_id,
@@ -613,6 +665,18 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if isinstance(failed_usage, TokenUsage):
+                    self.stats.token_usage += failed_usage
+                    if not is_last_candidate:
+                        self.provider_stat_segments.append(
+                            ProviderStatSegment(
+                                provider=candidate,
+                                usage=failed_usage,
+                                start_time=candidate_start_time,
+                                end_time=time.time(),
+                            )
+                        )
                 logger.warning(
                     "Chat Model %s request error: %s",
                     candidate_id,
@@ -1414,7 +1478,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
-                requery_resp = await self._await_or_stop(
+                requery_resp = await self._await_additional_provider_response(
                     self.provider.text_chat(
                         contexts=self._sanitize_contexts_for_provider(contexts),
                         func_tool=param_subset,
@@ -1444,7 +1508,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
-                    repair_resp = await self._await_or_stop(
+                    repair_resp = await self._await_additional_provider_response(
                         self.provider.text_chat(
                             contexts=self._sanitize_contexts_for_provider(
                                 repair_contexts

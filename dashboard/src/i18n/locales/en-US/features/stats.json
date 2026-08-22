@@ -65,6 +65,7 @@
   "modelTotal": {
     "title": "{range} total model calls",
     "callCount": "{count} calls",
+    "callBreakdown": "Agent {agent} · direct {provider} · test {test}",
     "avgTtft": "Average TTFT",
     "avgDuration": "Average Response Time",
     "avgTpm": "Average Output TPM",

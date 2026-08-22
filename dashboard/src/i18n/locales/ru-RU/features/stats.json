@@ -65,6 +65,7 @@
   "modelTotal": {
     "title": "{range} всего вызовов моделей",
     "callCount": "{count} вызовов",
+    "callBreakdown": "Агент {agent} · прямые {provider} · проверка {test}",
     "avgTtft": "Средний TTFT",
     "avgDuration": "Среднее время ответа",
     "avgTpm": "Средний Output TPM",
