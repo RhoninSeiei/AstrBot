@@ -50,6 +50,16 @@ def _build_service():
 
 
 @pytest.mark.asyncio
+async def test_source_model_catalog_includes_gpt_6_astra():
+    service, _manager, _reloads = _build_service()
+
+    result = await service.list_provider_source_models("openai_oauth")
+
+    assert result["provider_source_id"] == "openai_oauth"
+    assert result["models"][0] == "gpt-6-astra"
+
+
+@pytest.mark.asyncio
 async def test_source_upsert_waits_for_shared_refresh_lock():
     service, manager, reloads = _build_service()
     state = manager.get_openai_oauth_shared_state(

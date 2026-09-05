@@ -33,7 +33,7 @@ from .openai_source import ProviderOpenAIOfficial
 from .request_retry import retry_provider_request
 
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
-CODEX_CLIENT_VERSION = "0.144.0"
+CODEX_CLIENT_VERSION = "0.153.4"
 oauth_provider_stat_kind: ContextVar[str] = ContextVar(
     "oauth_provider_stat_kind",
     default="text",
@@ -63,6 +63,16 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         "image_edit": True,
     }
     model_capabilities = {
+        "gpt-6-astra": {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
+        },
         "gpt-5.6-sol": {
             "default_reasoning_effort": "low",
             "supported_reasoning_efforts": (

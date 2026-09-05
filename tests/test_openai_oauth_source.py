@@ -632,13 +632,24 @@ async def test_oauth_provider_exposes_codex_model_catalog_and_defaults():
     try:
         models = await provider.get_models()
 
-        assert models[:3] == [
+        assert models[:4] == [
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
         ]
+        assert provider.model_capabilities["gpt-6-astra"] == {
+            "default_reasoning_effort": "medium",
+            "supported_reasoning_efforts": (
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
+        }
         expected_efforts = ("none", "low", "medium", "high", "xhigh", "max")
-        for model in models[:3]:
+        for model in models[1:4]:
             assert (
                 provider.model_capabilities[model]["supported_reasoning_efforts"]
                 == expected_efforts
@@ -712,8 +723,8 @@ async def test_request_backend_sends_codex_identity_and_residency_headers(
         headers = sent_requests[0]["headers"]
         assert status_code == 200
         assert attempted_version == provider._oauth_shared_state.version
-        assert headers["version"] == "0.144.0"
-        assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
+        assert headers["version"] == "0.153.4"
+        assert headers["User-Agent"] == "codex_cli_rs/0.153.4"
         assert headers["x-openai-internal-codex-residency"] == "us"
     finally:
         await provider.terminate()
@@ -979,6 +990,39 @@ async def test_text_chat_reasoning_kwargs_override_model_configuration():
             "effort": "max",
             "summary": "auto",
         }
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_builds_astra_payload_with_reasoning_effort():
+    requested_payloads: list[dict] = []
+    provider = _make_provider({"model": "gpt-6-astra"})
+
+    async def fake_request_backend(payload: dict):
+        requested_payloads.append(payload)
+        return {"id": "resp_text", "output_text": "pong"}
+
+    provider._request_backend = fake_request_backend
+    try:
+        await provider.text_chat(prompt="ping", reasoning_effort="max")
+
+        assert requested_payloads == [
+            {
+                "model": "gpt-6-astra",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "ping",
+                    }
+                ],
+                "instructions": "",
+                "stream": True,
+                "store": False,
+                "reasoning": {"effort": "max"},
+            }
+        ]
     finally:
         await provider.terminate()
 
@@ -1577,7 +1621,9 @@ async def test_generate_image_records_partial_usage_when_cancelled(
 
     provider._request_image_backend = fake_request_image_backend
     try:
-        task = asyncio.create_task(provider.generate_image(prompt="draw two icons", n=2))
+        task = asyncio.create_task(
+            provider.generate_image(prompt="draw two icons", n=2)
+        )
         await second_request_started.wait()
         task.cancel()
 
@@ -1916,8 +1962,8 @@ async def test_generate_image_reads_sse_incrementally(monkeypatch, tmp_path):
         results = await provider.generate_image("draw from streaming response")
 
         assert sent_requests[0]["method"] == "POST"
-        assert sent_requests[0]["headers"]["version"] == "0.144.0"
-        assert sent_requests[0]["headers"]["User-Agent"] == ("codex_cli_rs/0.144.0")
+        assert sent_requests[0]["headers"]["version"] == "0.153.4"
+        assert sent_requests[0]["headers"]["User-Agent"] == ("codex_cli_rs/0.153.4")
         assert sent_requests[0]["headers"]["x-openai-internal-codex-residency"] == "eu"
         assert sent_requests[0]["json"]["stream"] is True
         assert (
