@@ -248,6 +248,58 @@ async def test_tool_loop_agent_persists_one_aggregated_provider_stat(
 
 
 @pytest.mark.asyncio
+async def test_tool_loop_agent_places_request_policies_on_provider_request(
+    temp_db,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = StatsProvider()
+    reset_calls = []
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.provider = provider
+            self.stats = AgentStats(start_time=1.0, end_time=2.0)
+
+        async def reset(self, **kwargs) -> None:
+            reset_calls.append(kwargs)
+
+        async def step_until_done(self, max_steps):
+            if False:
+                yield None
+
+        def get_final_llm_resp(self) -> LLMResponse:
+            return LLMResponse(role="assistant", completion_text="done")
+
+        def was_aborted(self) -> bool:
+            return False
+
+    monkeypatch.setattr("astrbot.core.star.context.ToolLoopAgentRunner", FakeRunner)
+    context = Context.__new__(Context)
+    context._db = temp_db
+    context.provider_manager = SimpleNamespace(
+        get_provider_by_id=AsyncMock(return_value=provider),
+    )
+
+    await context.tool_loop_agent(
+        event=SimpleNamespace(unified_msg_origin="test:policy"),
+        chat_provider_id="provider-1",
+        prompt="test",
+        agent_context=SimpleNamespace(),
+        oauth_web_search="disabled",
+        retry_rate_limits=False,
+        fallback_on_rate_limit=False,
+    )
+
+    request = reset_calls[0]["request"]
+    assert request.oauth_web_search == "disabled"
+    assert request.retry_rate_limits is False
+    assert request.fallback_on_rate_limit is False
+    assert "oauth_web_search" not in reset_calls[0]
+    assert "retry_rate_limits" not in reset_calls[0]
+    assert "fallback_on_rate_limit" not in reset_calls[0]
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_agent_persists_failed_provider_stat(
     temp_db,
     monkeypatch: pytest.MonkeyPatch,

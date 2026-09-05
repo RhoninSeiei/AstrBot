@@ -47,6 +47,11 @@ from astrbot.core.provider.modalities import (
     sanitize_contexts_by_modalities,
 )
 from astrbot.core.provider.provider import Provider, provider_stats_managed_by_agent
+from astrbot.core.provider.sources.request_retry import (
+    get_provider_request_status_code,
+    provider_oauth_web_search,
+    provider_retry_rate_limits,
+)
 from astrbot.core.provider.stats import ProviderStatSegment
 
 from ..context.compressor import ContextCompressor
@@ -465,13 +470,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
     @contextmanager
     def _provider_stats_scope(self) -> T.Iterator[None]:
-        token = provider_stats_managed_by_agent.set(
+        stats_token = provider_stats_managed_by_agent.set(
             self.provider_stats_managed_by_agent
         )
+        retry_token = provider_retry_rate_limits.set(self.req.retry_rate_limits)
+        search_token = provider_oauth_web_search.set(self.req.oauth_web_search)
         try:
             yield
         finally:
-            provider_stats_managed_by_agent.reset(token)
+            provider_oauth_web_search.reset(search_token)
+            provider_retry_rate_limits.reset(retry_token)
+            provider_stats_managed_by_agent.reset(stats_token)
 
     def _accumulate_token_usage(self, usage: TokenUsage | None) -> None:
         if usage is None:
@@ -631,6 +640,12 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     and not has_stream_output
                                     and (not is_last_candidate)
                                 ):
+                                    if (
+                                        resp.status_code == 429
+                                        and not self.req.fallback_on_rate_limit
+                                    ):
+                                        yield resp
+                                        return
                                     last_err_response = resp
                                     last_exception = None
                                     failed_usage = resp.usage or TokenUsage()
@@ -695,6 +710,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 )
                 if candidate_has_stream_output:
                     break
+                if (
+                    get_provider_request_status_code(exc) == 429
+                    and not self.req.fallback_on_rate_limit
+                ):
+                    break
                 continue
 
         if last_err_response:
@@ -707,6 +727,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     "All chat models failed: "
                     f"{type(last_exception).__name__}: {last_exception}"
                 ),
+                status_code=get_provider_request_status_code(last_exception),
             )
             return
         yield LLMResponse(

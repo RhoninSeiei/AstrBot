@@ -34,6 +34,10 @@ from astrbot.core.provider.provider import (
     TTSProvider,
     provider_stats_managed_by_agent,
 )
+from astrbot.core.provider.sources.request_retry import (
+    provider_oauth_web_search,
+    provider_retry_rate_limits,
+)
 from astrbot.core.provider.stats import (
     record_agent_runner_stats,
     record_llm_response_stats,
@@ -211,6 +215,12 @@ class Context:
         llm_resp = None
         failed_usage = None
         stats_token = provider_stats_managed_by_agent.set(True)
+        retry_token = provider_retry_rate_limits.set(
+            bool(kwargs.get("retry_rate_limits", True))
+        )
+        search_token = provider_oauth_web_search.set(
+            str(kwargs.get("oauth_web_search", "inherit"))
+        )
         try:
             try:
                 llm_resp = await prov.text_chat(
@@ -226,6 +236,8 @@ class Context:
                 failed_usage = getattr(exc, "_astrbot_token_usage", None)
                 raise
             finally:
+                provider_oauth_web_search.reset(search_token)
+                provider_retry_rate_limits.reset(retry_token)
                 provider_stats_managed_by_agent.reset(stats_token)
         finally:
             session_id = kwargs.get("session_id") or "sdk"
@@ -316,6 +328,9 @@ class Context:
             func_tool=tools,
             contexts=context_,
             system_prompt=system_prompt or "",
+            oauth_web_search=kwargs.get("oauth_web_search", "inherit"),
+            retry_rate_limits=bool(kwargs.get("retry_rate_limits", True)),
+            fallback_on_rate_limit=bool(kwargs.get("fallback_on_rate_limit", True)),
         )
         if agent_context is None:
             agent_context = AstrAgentContext(
@@ -330,7 +345,15 @@ class Context:
         other_kwargs = {
             k: v
             for k, v in kwargs.items()
-            if k not in ["stream", "agent_hooks", "agent_context"]
+            if k
+            not in [
+                "stream",
+                "agent_hooks",
+                "agent_context",
+                "oauth_web_search",
+                "retry_rate_limits",
+                "fallback_on_rate_limit",
+            ]
         }
         other_kwargs["provider_stats_managed_by_agent"] = True
         if request.func_tool and request.func_tool.get_tool("astrbot_file_read_tool"):
