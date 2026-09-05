@@ -41,7 +41,7 @@ class PlatformStat(SQLModel, table=True):
 
 
 class ProviderStat(TimestampMixin, SQLModel, table=True):
-    """Per-response provider stats for internal agent runs."""
+    """Per-response provider usage statistics shown by the Dashboard."""
 
     __tablename__: str = "provider_stats"
 

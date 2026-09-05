@@ -65,6 +65,7 @@
   "modelTotal": {
     "title": "{range}模型调用总量",
     "callCount": "共 {count} 次调用",
+    "callBreakdown": "代理 {agent} · 直接调用 {provider} · 检查 {test}",
     "avgTtft": "平均首字延迟（TTFT）",
     "avgDuration": "平均响应时间",
     "avgTpm": "平均每分钟输出（TPM）",
