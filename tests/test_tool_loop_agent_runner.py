@@ -272,6 +272,23 @@ class MockAbortableStreamProvider(MockProvider):
         )
 
 
+class MockPartialStreamFailureProvider(MockProvider):
+    """Emit one visible chunk before raising the configured stream failure."""
+
+    def __init__(self, exception_type: type[Exception]):
+        super().__init__()
+        self.exception_type = exception_type
+
+    async def text_chat_stream(self, **kwargs):
+        self.call_count += 1
+        yield LLMResponse(
+            role="assistant",
+            completion_text="visible partial",
+            is_chunk=True,
+        )
+        raise self.exception_type("stream failed after visible output")
+
+
 class MockBlockingProvider(MockProvider):
     """Provider that records cancellation while waiting for its first response."""
 
@@ -1445,6 +1462,81 @@ async def test_empty_output_retries_exhausted_then_uses_fallback_provider(
     assert final_resp.completion_text == "这是我的最终回答"
     assert primary_provider.call_count == runner.EMPTY_OUTPUT_RETRY_ATTEMPTS
     assert fallback_provider.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_type", [RuntimeError, EmptyModelOutputError])
+async def test_partial_stream_failure_does_not_retry_or_replay_fallback(
+    exception_type,
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+    monkeypatch,
+):
+    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MIN_S", 0)
+    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MAX_S", 0)
+    primary_provider = MockPartialStreamFailureProvider(exception_type)
+    primary_provider.provider_config["id"] = "primary"
+    fallback_provider = MockProvider()
+    fallback_provider.provider_config["id"] = "fallback"
+    fallback_provider.should_call_tools = False
+
+    await runner.reset(
+        provider=primary_provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=True,
+        fallback_providers=[fallback_provider],
+    )
+
+    responses = [response async for response in runner.step()]
+
+    assert any(response.type == "streaming_delta" for response in responses)
+    assert any(response.type == "err" for response in responses)
+    assert primary_provider.call_count == 1
+    assert fallback_provider.call_count == 0
+    final_resp = runner.get_final_llm_resp()
+    assert final_resp is not None
+    assert final_resp.role == "err"
+    assert "stream failed after visible output" in final_resp.completion_text
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_before_first_chunk_still_uses_fallback(
+    runner,
+    provider_request,
+    mock_tool_executor,
+    mock_hooks,
+):
+    primary_provider = MockFailingProvider()
+    primary_provider.provider_config["id"] = "primary"
+    fallback_provider = MockProvider()
+    fallback_provider.provider_config["id"] = "fallback"
+    fallback_provider.should_call_tools = False
+
+    await runner.reset(
+        provider=primary_provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=True,
+        fallback_providers=[fallback_provider],
+    )
+
+    responses = [response async for response in runner.step()]
+
+    assert any(response.type == "streaming_delta" for response in responses)
+    assert not any(response.type == "err" for response in responses)
+    assert primary_provider.call_count == 1
+    assert fallback_provider.call_count == 1
+    final_resp = runner.get_final_llm_resp()
+    assert final_resp is not None
+    assert final_resp.role == "assistant"
+    assert final_resp.completion_text == "这是我的最终回答"
 
 
 @pytest.mark.asyncio

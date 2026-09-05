@@ -2152,6 +2152,10 @@ class ProviderConfigService:
                 provider
                 for provider in list(self.config.get("provider", []))
                 if provider.get("provider_source_id") == source_id
+                or (
+                    provider.get("type") == "openai_oauth_stt"
+                    and provider.get("oauth_source_id") == source_id
+                )
             ]
         )
 
@@ -2165,6 +2169,12 @@ class ProviderConfigService:
             if provider.get("provider_source_id") == old_source_id:
                 provider["provider_source_id"] = next_source_id
                 affected_providers.append(provider)
+            elif (
+                provider.get("type") == "openai_oauth_stt"
+                and provider.get("oauth_source_id") == old_source_id
+            ):
+                provider["oauth_source_id"] = next_source_id
+                affected_providers.append(provider)
         return affected_providers
 
     async def _reload_providers(self, providers: list[dict]) -> None:
@@ -2172,4 +2182,14 @@ class ProviderConfigService:
         if not callable(reload_fn):
             return
         for provider in providers:
+            if provider.get("type") == "openai_oauth_stt":
+                source = self._find_provider_source(provider.get("oauth_source_id", ""))
+                if (
+                    source is None
+                    or source.get("type") != "openai_oauth_chat_completion"
+                    or source.get("auth_mode") != "openai_oauth"
+                    or source.get("enable") is False
+                ):
+                    await self.provider_manager.terminate_provider(provider["id"])
+                    continue
             await run_maybe_async(lambda provider=provider: reload_fn(provider))

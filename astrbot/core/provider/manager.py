@@ -423,6 +423,8 @@ class ProviderManager:
                 from .sources.openai_oauth_source import (
                     ProviderOpenAIOAuth as ProviderOpenAIOAuth,
                 )
+            case "openai_oauth_stt":
+                from .sources import openai_oauth_stt_source as openai_oauth_stt_source
             case "longcat_chat_completion":
                 from .sources.longcat_source import ProviderLongCat as ProviderLongCat
             case "minimax_token_plan":
@@ -729,6 +731,44 @@ class ProviderManager:
 
                         merged_config["oauth_persist_callback"] = persist_callback
                 pc = merged_config
+        if (
+            pc.get("type") == "openai_oauth_stt"
+            and runtime
+            and pc.get("enable") is not False
+        ):
+            source_id = pc.get("oauth_source_id", "")
+            source = next(
+                (s for s in self.provider_sources_config if s.get("id") == source_id),
+                None,
+            )
+            if (
+                not source_id
+                or source is None
+                or source.get("type") != "openai_oauth_chat_completion"
+                or source.get("auth_mode") != "openai_oauth"
+            ):
+                raise ValueError("STT requires an existing ChatGPT OAuth source")
+            for field in (
+                "oauth_access_token",
+                "oauth_refresh_token",
+                "oauth_expires_at",
+                "oauth_account_id",
+                "oauth_account_email",
+            ):
+                pc.pop(field, None)
+            for field in ("proxy", "http_proxy"):
+                pc.pop(field, None)
+                if field in source:
+                    pc[field] = source[field]
+            pc["auth_mode"] = "openai_oauth"
+            pc["oauth_shared_state"] = self.get_openai_oauth_shared_state(
+                source_id, source
+            )
+
+            async def persist_stt_patch(patch: dict) -> None:
+                await self._persist_openai_oauth_provider_source_patch(source_id, patch)
+
+            pc["oauth_persist_callback"] = persist_stt_patch
         return pc
 
     def get_provider_config_by_id(
@@ -1044,7 +1084,11 @@ class ProviderManager:
                 target_prov_ids.append(provider_id)
             else:
                 for prov in self.providers_config:
-                    if prov.get("provider_source_id") == provider_source_id:
+                    if prov.get("provider_source_id") == provider_source_id or (
+                        provider_source_id
+                        and prov.get("type") == "openai_oauth_stt"
+                        and prov.get("oauth_source_id") == provider_source_id
+                    ):
                         target_prov_ids.append(prov.get("id"))
             config = self.acm.default_conf
             for tpid in target_prov_ids:

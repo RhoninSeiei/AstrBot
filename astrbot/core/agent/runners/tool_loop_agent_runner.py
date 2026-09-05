@@ -19,7 +19,7 @@ from mcp.types import (
 )
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -593,9 +593,15 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 )
             self.provider = candidate
             candidate_start_time = time.time()
+            candidate_has_stream_output = False
             try:
                 retrying = AsyncRetrying(
-                    retry=retry_if_exception_type(EmptyModelOutputError),
+                    retry=retry_if_exception(
+                        lambda exc: (
+                            isinstance(exc, EmptyModelOutputError)
+                            and not candidate_has_stream_output
+                        )
+                    ),
                     stop=stop_after_attempt(self.EMPTY_OUTPUT_RETRY_ATTEMPTS),
                     wait=wait_exponential(
                         multiplier=1,
@@ -616,6 +622,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                             ):
                                 if resp.is_chunk:
                                     has_stream_output = True
+                                    candidate_has_stream_output = True
                                     yield resp
                                     continue
 
@@ -686,6 +693,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     exc,
                     exc_info=True,
                 )
+                if candidate_has_stream_output:
+                    break
                 continue
 
         if last_err_response:

@@ -6,11 +6,13 @@ import mimetypes
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -22,9 +24,11 @@ from astrbot.core.provider.oauth.openai_oauth import (
     decode_jwt_claims,
     refresh_access_token,
 )
+from astrbot.core.provider.oauth.openai_oauth_audio import OpenAIOAuthAudioMixin
 from astrbot.core.provider.oauth.openai_oauth_shared_state import (
     OpenAIOAuthSharedState,
 )
+from astrbot.core.provider.oauth.openai_oauth_sse import iter_json_sse_events
 from astrbot.core.provider.provider import provider_stats_managed_by_agent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -52,10 +56,10 @@ class OpenAIOAuthImageResult:
     "openai_oauth_chat_completion",
     "OpenAI OAuth / ChatGPT Codex 提供商适配器",
 )
-class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
+class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
     capabilities = {
         "chat": True,
-        "stream": False,
+        "stream": True,
         "vision_input": True,
         "function_call": True,
         "reasoning": True,
@@ -407,6 +411,77 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             raise Exception(self._format_backend_error(status_code, text))
         return self._parse_backend_response(text)
 
+    @asynccontextmanager
+    async def _open_oauth_stream_client(self):
+        if getattr(self, "_oauth_media_closed", False):
+            raise RuntimeError("OAuth provider is closed")
+        if not hasattr(self, "_oauth_stream_clients"):
+            self._oauth_stream_clients = set()
+        client = httpx.AsyncClient(
+            proxy=self.provider_config.get("proxy") or None,
+            timeout=self.timeout,
+            follow_redirects=False,
+        )
+        self._oauth_stream_clients.add(client)
+        try:
+            async with client:
+                yield client
+        finally:
+            self._oauth_stream_clients.discard(client)
+
+    async def _stream_backend_events(
+        self,
+        payload: dict[str, Any],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield decoded SSE events and refresh OAuth only before any output."""
+        if getattr(self, "_oauth_media_closed", False):
+            raise RuntimeError("OAuth provider is closed")
+        await self._ensure_fresh_oauth_token()
+        auth_retry_available = True
+        while True:
+            headers, attempted_version = self._build_backend_headers_with_version()
+            retry_after_auth = False
+            async with self._open_oauth_stream_client() as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/responses",
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if response.status_code == 401 and auth_retry_available:
+                        raw_body = await response.aread()
+                        refreshed = await self._refresh_after_auth_failure(
+                            attempted_version
+                        )
+                        if refreshed:
+                            auth_retry_available = False
+                            retry_after_auth = True
+                        else:
+                            text = raw_body.decode("utf-8", errors="replace")
+                            raise Exception(
+                                self._format_backend_error(response.status_code, text)
+                            )
+                    elif response.status_code < 200 or response.status_code >= 300:
+                        raw_body = await response.aread()
+                        text = raw_body.decode("utf-8", errors="replace")
+                        raise Exception(
+                            self._format_backend_error(response.status_code, text)
+                        )
+                    else:
+                        async for event in iter_json_sse_events(response.aiter_lines()):
+                            yield event
+                            if event.get("type") in {
+                                "response.completed",
+                                "response.error",
+                                "response.failed",
+                                "response.incomplete",
+                                "error",
+                            }:
+                                return
+            if retry_after_auth:
+                continue
+            return
+
     async def _request_image_backend_once(
         self,
         payload: dict[str, Any],
@@ -569,7 +644,9 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         content_parts: list[dict[str, Any]] = []
         for part in raw_content:
             if not isinstance(part, dict):
-                continue
+                raise ValueError(
+                    f"OpenAI OAuth 不支持非对象消息内容：{type(part).__name__}。"
+                )
             part_type = part.get("type")
             if part_type == "text":
                 content_parts.append(
@@ -589,6 +666,12 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                             "image_url": str(image_url),
                         }
                     )
+            else:
+                unsupported_type = str(part_type or "unknown")
+                raise ValueError(
+                    "OpenAI OAuth 尚未适配消息内容类型 "
+                    f"{unsupported_type}，不能静默丢弃。"
+                )
         if not content_parts:
             return ""
         if len(content_parts) == 1 and content_parts[0]["type"] == "input_text":
@@ -772,6 +855,205 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             backend_tools.append(backend_tool)
         return backend_tools
 
+    @staticmethod
+    def _tool_identity(tool: dict[str, Any]) -> str:
+        tool_type = str(tool.get("type") or "").strip()
+        if tool_type == "function":
+            name = str(tool.get("name") or "").strip()
+            if not name:
+                raise ValueError("function 工具缺少 name。")
+            return f"function:{name}"
+        if tool_type == "mcp":
+            label = str(tool.get("server_label") or "").strip()
+            if not label:
+                raise ValueError("mcp 工具缺少 server_label。")
+            return f"mcp:{label}"
+        if not tool_type:
+            raise ValueError("工具定义缺少 type。")
+        return tool_type
+
+    def _merge_backend_tools(
+        self,
+        *tool_groups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        by_identity: dict[str, dict[str, Any]] = {}
+        for group in tool_groups:
+            for tool in group:
+                if not isinstance(tool, dict):
+                    raise ValueError("工具定义必须是对象。")
+                identity = self._tool_identity(tool)
+                existing = by_identity.get(identity)
+                if existing is None:
+                    copied = dict(tool)
+                    by_identity[identity] = copied
+                    merged.append(copied)
+                    continue
+                if existing != tool:
+                    raise ValueError(f"工具 {identity} 存在冲突定义。")
+        return merged
+
+    def _configured_web_search_tool(self) -> list[dict[str, Any]]:
+        mode = (
+            str(self.provider_config.get("oauth_web_search") or "disabled")
+            .strip()
+            .lower()
+        )
+        if mode == "disabled":
+            return []
+        if mode not in {"cached", "live"}:
+            raise ValueError("oauth_web_search 必须是 disabled、cached 或 live。")
+        tool: dict[str, Any] = {
+            "type": "web_search",
+            "external_web_access": mode == "live",
+        }
+        domains = self.provider_config.get("oauth_web_search_domains") or []
+        if not isinstance(domains, list):
+            raise ValueError("oauth_web_search_domains 必须是字符串列表。")
+        normalized_domains = []
+        for domain in domains:
+            if not isinstance(domain, str) or not domain.strip():
+                raise ValueError("oauth_web_search_domains 必须是非空字符串列表。")
+            normalized = domain.strip().lower()
+            if "://" in normalized or "/" in normalized:
+                raise ValueError(
+                    "oauth_web_search_domains 仅接受域名，不接受 URL 或路径。"
+                )
+            if normalized not in normalized_domains:
+                normalized_domains.append(normalized)
+        if normalized_domains:
+            tool["filters"] = {"allowed_domains": normalized_domains}
+        return [tool]
+
+    def _build_responses_params(self, payloads: dict, tools) -> dict[str, Any]:
+        instructions, backend_input = self._convert_messages_to_backend_input(
+            payloads.get("messages", []) or []
+        )
+        params: dict[str, Any] = {
+            "model": payloads.get("model", self.get_model()),
+            "input": backend_input,
+            "instructions": instructions,
+            "stream": True,
+            "store": False,
+        }
+        function_tools: list[dict[str, Any]] = []
+        if tools:
+            tool_list = tools.get_func_desc_openai_style(
+                omit_empty_parameter_field=False,
+            )
+            if tool_list:
+                function_tools = self._convert_tools_to_backend_format(tool_list)
+
+        custom_extra_body = self.provider_config.get("custom_extra_body", {})
+        custom_tools: list[dict[str, Any]] = []
+        if isinstance(custom_extra_body, dict):
+            for key, value in custom_extra_body.items():
+                if key in {"model", "input", "instructions"}:
+                    continue
+                if key == "tools":
+                    if not isinstance(value, list):
+                        raise ValueError("custom_extra_body.tools 必须是列表。")
+                    custom_tools = value
+                    continue
+                params[key] = value
+
+        merged_tools = self._merge_backend_tools(
+            function_tools,
+            custom_tools,
+            self._configured_web_search_tool(),
+        )
+        if merged_tools:
+            params["tools"] = merged_tools
+        if payloads.get("tool_choice") is not None:
+            params["tool_choice"] = payloads["tool_choice"]
+
+        reasoning_value = params.get("reasoning")
+        if reasoning_value is not None and not isinstance(reasoning_value, dict):
+            raise ValueError("reasoning 必须是对象。")
+        reasoning = dict(reasoning_value or {})
+
+        configured_effort = params.pop("reasoning_effort", None)
+        if configured_effort is not None and "effort" not in reasoning:
+            reasoning["effort"] = configured_effort
+
+        request_effort = payloads.get("reasoning_effort")
+        if request_effort is not None:
+            reasoning["effort"] = request_effort
+        request_reasoning = payloads.get("reasoning")
+        if request_reasoning is not None:
+            if not isinstance(request_reasoning, dict):
+                raise ValueError("reasoning 必须是对象。")
+            reasoning.update(request_reasoning)
+
+        if "effort" in reasoning:
+            effort = str(reasoning["effort"] or "").strip().lower()
+            if effort == "off":
+                effort = "none"
+            if effort == "ultra":
+                raise ValueError(
+                    "reasoning_effort=ultra 需要多代理调度，不能作为单次 Provider 请求发送。"
+                )
+            model = str(params["model"] or "").strip().lower()
+            capability = self.model_capabilities.get(model)
+            if capability:
+                supported = capability["supported_reasoning_efforts"]
+                if effort == "max" and effort not in supported and "xhigh" in supported:
+                    effort = "xhigh"
+                elif effort not in supported:
+                    supported_text = ", ".join(supported)
+                    raise ValueError(
+                        f"模型 {model} 不支持 reasoning_effort={effort}；"
+                        f"可用值：{supported_text}。"
+                    )
+            reasoning["effort"] = effort
+
+        if reasoning:
+            params["reasoning"] = reasoning
+        else:
+            params.pop("reasoning", None)
+        params.pop("max_output_tokens", None)
+        params.pop("temperature", None)
+        return params
+
+    @staticmethod
+    def _extract_url_citations(response: Any) -> list[tuple[str, str]]:
+        if not isinstance(response, dict):
+            return []
+        citations: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+        for item in response.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []) or []:
+                if not isinstance(content, dict):
+                    continue
+                for annotation in content.get("annotations", []) or []:
+                    if not isinstance(annotation, dict):
+                        continue
+                    if annotation.get("type") not in {"url_citation", "source"}:
+                        continue
+                    url = str(annotation.get("url") or "").strip()
+                    if not url.startswith(("https://", "http://")) or url in seen_urls:
+                        continue
+                    if any(ord(char) < 32 for char in url):
+                        continue
+                    try:
+                        parsed_url = urlsplit(url)
+                        if not parsed_url.hostname or parsed_url.username:
+                            continue
+                    except ValueError:
+                        continue
+                    title = str(annotation.get("title") or url).strip() or url
+                    title = " ".join(title.split())[:512]
+                    title = (
+                        title.replace("\\", "\\\\")
+                        .replace("[", "\\[")
+                        .replace("]", "\\]")
+                    )
+                    seen_urls.add(url)
+                    citations.append((title, quote(url, safe=":/?#@!$&'*+,;=%~.-_")))
+        return citations
+
     async def _parse_responses_completion(self, response: Any, tools) -> LLMResponse:
         llm_response = LLMResponse("assistant")
         output_text = ""
@@ -779,9 +1061,6 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             output_text = str(response.get("output_text") or "").strip()
         else:
             output_text = (getattr(response, "output_text", None) or "").strip()
-        if output_text:
-            llm_response.result_chain = MessageChain().message(output_text)
-
         output_items = list(
             response.get("output", [])
             if isinstance(response, dict)
@@ -791,6 +1070,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         tool_args: list[dict[str, Any]] = []
         tool_names: list[str] = []
         tool_ids: list[str] = []
+        message_text_parts: list[str] = []
 
         for item in output_items:
             item_type = (
@@ -812,7 +1092,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                     )
                     if text:
                         reasoning_parts.append(str(text))
-            elif item_type == "function_call" and tools is not None:
+            elif item_type == "function_call":
                 arguments = (
                     item.get("arguments", "{}")
                     if isinstance(item, dict)
@@ -863,9 +1143,17 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
                         if text:
                             item_text_parts.append(str(text))
                 if item_text_parts:
-                    llm_response.result_chain = MessageChain().message(
-                        "".join(item_text_parts).strip()
-                    )
+                    message_text_parts.append("".join(item_text_parts).strip())
+
+        output_text = output_text or "\n".join(message_text_parts)
+        citations = self._extract_url_citations(response)
+        if output_text:
+            if citations:
+                citation_text = "\n".join(
+                    f"- [{title}]({url})" for title, url in citations
+                )
+                output_text += f"\n\n来源：\n{citation_text}"
+            llm_response.result_chain = MessageChain().message(output_text)
 
         if reasoning_parts:
             llm_response.reasoning_content = "\n".join(
@@ -940,6 +1228,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         managed_by_agent = provider_stats_managed_by_agent.get()
         request_kind = oauth_provider_stat_kind.get()
         start_time = time.time()
+        kwargs["_oauth_tool_choice"] = tool_choice
         try:
             response = await super().text_chat(
                 prompt=prompt,
@@ -1007,75 +1296,7 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         *,
         request_max_retries: int | None = None,
     ) -> LLMResponse:
-        instructions, backend_input = self._convert_messages_to_backend_input(
-            payloads.get("messages", []) or []
-        )
-        params: dict[str, Any] = {
-            "model": payloads.get("model", self.get_model()),
-            "input": backend_input,
-            "instructions": instructions,
-            "stream": True,
-            "store": False,
-        }
-        if tools:
-            tool_list = tools.get_func_desc_openai_style(
-                omit_empty_parameter_field=False,
-            )
-            if tool_list:
-                params["tools"] = self._convert_tools_to_backend_format(tool_list)
-        custom_extra_body = self.provider_config.get("custom_extra_body", {})
-        if isinstance(custom_extra_body, dict):
-            for key, value in custom_extra_body.items():
-                if key in {"model", "input", "instructions"}:
-                    continue
-                params[key] = value
-
-        reasoning_value = params.get("reasoning")
-        if reasoning_value is not None and not isinstance(reasoning_value, dict):
-            raise ValueError("reasoning 必须是对象。")
-        reasoning = dict(reasoning_value or {})
-
-        configured_effort = params.pop("reasoning_effort", None)
-        if configured_effort is not None and "effort" not in reasoning:
-            reasoning["effort"] = configured_effort
-
-        request_effort = payloads.get("reasoning_effort")
-        if request_effort is not None:
-            reasoning["effort"] = request_effort
-        request_reasoning = payloads.get("reasoning")
-        if request_reasoning is not None:
-            if not isinstance(request_reasoning, dict):
-                raise ValueError("reasoning 必须是对象。")
-            reasoning.update(request_reasoning)
-
-        if "effort" in reasoning:
-            effort = str(reasoning["effort"] or "").strip().lower()
-            if effort == "off":
-                effort = "none"
-            if effort == "ultra":
-                raise ValueError(
-                    "reasoning_effort=ultra 需要多代理调度，不能作为单次 Provider 请求发送。"
-                )
-            model = str(params["model"] or "").strip().lower()
-            capability = self.model_capabilities.get(model)
-            if capability:
-                supported = capability["supported_reasoning_efforts"]
-                if effort == "max" and effort not in supported and "xhigh" in supported:
-                    effort = "xhigh"
-                elif effort not in supported:
-                    supported_text = ", ".join(supported)
-                    raise ValueError(
-                        f"模型 {model} 不支持 reasoning_effort={effort}；"
-                        f"可用值：{supported_text}。"
-                    )
-            reasoning["effort"] = effort
-
-        if reasoning:
-            params["reasoning"] = reasoning
-        else:
-            params.pop("reasoning", None)
-        params.pop("max_output_tokens", None)
-        params.pop("temperature", None)
+        params = self._build_responses_params(payloads, tools)
         response = await retry_provider_request(
             "OpenAI OAuth",
             lambda: self._request_backend(params),
@@ -1092,6 +1313,166 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
             if usage is not None:
                 setattr(exc, "_astrbot_token_usage", usage)
             raise
+
+    async def _query_stream(
+        self,
+        payloads: dict,
+        tools,
+        *,
+        request_max_retries: int | None = None,
+    ) -> AsyncGenerator[LLMResponse, None]:
+        del request_max_retries
+        params = self._build_responses_params(payloads, tools)
+        output_text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        output_items: dict[str, dict[str, Any]] = {}
+        completed_response: dict[str, Any] | None = None
+
+        async with aclosing(self._stream_backend_events(params)) as event_stream:
+            async for event in event_stream:
+                chunk, completed = self._apply_stream_event(
+                    event,
+                    output_text_parts,
+                    reasoning_parts,
+                    output_items,
+                )
+                if completed is not None:
+                    completed_response = completed
+                if chunk is not None:
+                    yield chunk
+
+        if completed_response is None:
+            raise Exception(
+                "Codex backend stream ended without response.completed event"
+            )
+        if not completed_response.get("output") and output_items:
+            completed_response["output"] = list(output_items.values())
+        if output_text_parts and not completed_response.get("output_text"):
+            completed_response["output_text"] = "".join(output_text_parts)
+        if reasoning_parts:
+            existing_output = list(completed_response.get("output") or [])
+            if not any(
+                isinstance(item, dict) and item.get("type") == "reasoning"
+                for item in existing_output
+            ):
+                existing_output.append(
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            {"type": "summary_text", "text": "".join(reasoning_parts)}
+                        ],
+                    }
+                )
+                completed_response["output"] = existing_output
+        final_response = await self._parse_responses_completion(
+            completed_response, tools
+        )
+        if not output_text_parts and final_response.completion_text:
+            yield LLMResponse(
+                role="assistant",
+                completion_text=final_response.completion_text,
+                is_chunk=True,
+            )
+        elif output_text_parts:
+            citations = self._extract_url_citations(completed_response)
+            if citations:
+                citation_text = "\n".join(
+                    f"- [{title}]({url})" for title, url in citations
+                )
+                yield LLMResponse(
+                    role="assistant",
+                    completion_text=f"\n\n来源：\n{citation_text}",
+                    is_chunk=True,
+                )
+        yield final_response
+
+    def _apply_stream_event(
+        self,
+        event: dict[str, Any],
+        output_text_parts: list[str],
+        reasoning_parts: list[str],
+        output_items: dict[str, dict[str, Any]],
+    ) -> tuple[LLMResponse | None, dict[str, Any] | None]:
+        event_type = event.get("type")
+        if event_type in {
+            "error",
+            "response.error",
+            "response.failed",
+            "response.incomplete",
+        }:
+            error = RuntimeError(f"Codex backend stream ended with {event_type}")
+            response = event.get("response")
+            if isinstance(response, dict):
+                usage = self._extract_response_usage(response.get("usage"))
+                if usage is not None:
+                    setattr(error, "_astrbot_token_usage", usage)
+            raise error
+        if event_type == "response.output_text.delta":
+            delta = str(event.get("delta") or "")
+            if delta:
+                output_text_parts.append(delta)
+                return (
+                    LLMResponse(
+                        role="assistant",
+                        completion_text=delta,
+                        is_chunk=True,
+                    ),
+                    None,
+                )
+        elif event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
+            delta = str(event.get("delta") or "")
+            if delta:
+                reasoning_parts.append(delta)
+                return (
+                    LLMResponse(
+                        role="assistant",
+                        reasoning_content=delta,
+                        is_chunk=True,
+                    ),
+                    None,
+                )
+        elif event_type == "response.output_item.added":
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_id = str(item.get("id") or event.get("output_index") or "")
+                if item_id:
+                    output_items[item_id] = dict(item)
+        elif event_type == "response.function_call_arguments.delta":
+            item_id = str(event.get("item_id") or event.get("output_index") or "")
+            delta = str(event.get("delta") or "")
+            item = output_items.setdefault(
+                item_id,
+                {
+                    "type": "function_call",
+                    "call_id": str(event.get("call_id") or ""),
+                    "name": str(event.get("name") or ""),
+                    "arguments": "",
+                },
+            )
+            item["arguments"] = str(item.get("arguments") or "") + delta
+            if delta:
+                return (
+                    LLMResponse(
+                        role="tool",
+                        tools_call_args=[{"_arguments_delta": delta}],
+                        tools_call_name=[str(item.get("name") or "")],
+                        tools_call_ids=[str(item.get("call_id") or item_id)],
+                        is_chunk=True,
+                    ),
+                    None,
+                )
+        elif event_type == "response.output_item.done":
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_id = str(item.get("id") or event.get("output_index") or "")
+                output_items[item_id] = dict(item)
+        elif event_type == "response.completed":
+            response = event.get("response")
+            return None, dict(response) if isinstance(response, dict) else {}
+        return None, None
 
     async def generate_image(
         self,
@@ -1309,18 +1690,70 @@ class ProviderOpenAIOAuth(ProviderOpenAIOfficial):
         **kwargs,
     ) -> AsyncGenerator[LLMResponse, None]:
         extra_user_content_parts = kwargs.pop("extra_user_content_parts", None)
-        yield await self.text_chat(
-            prompt=prompt,
-            session_id=session_id,
-            image_urls=image_urls,
-            audio_urls=audio_urls,
-            func_tool=func_tool,
-            contexts=contexts,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
+        payloads, _context_query = await self._prepare_chat_payload(
+            prompt,
+            image_urls,
+            audio_urls,
+            contexts,
+            system_prompt,
+            tool_calls_result,
             model=model,
             extra_user_content_parts=extra_user_content_parts,
-            tool_choice=tool_choice,
-            request_max_retries=request_max_retries,
             **kwargs,
         )
+        if (func_tool and not func_tool.empty()) or tool_choice != "auto":
+            payloads["tool_choice"] = tool_choice
+
+        managed_by_agent = provider_stats_managed_by_agent.get()
+        request_kind = oauth_provider_stat_kind.get()
+        start_time = time.time()
+        final_response: LLMResponse | None = None
+        try:
+            async with aclosing(
+                self._query_stream(
+                    payloads,
+                    func_tool,
+                    request_max_retries=request_max_retries,
+                )
+            ) as response_stream:
+                async for response in response_stream:
+                    if not response.is_chunk:
+                        final_response = response
+                    yield response
+        except (asyncio.CancelledError, GeneratorExit):
+            if not managed_by_agent:
+                await self._record_provider_stat(
+                    request_kind=request_kind,
+                    status="error",
+                    usage=None,
+                    start_time=start_time,
+                    end_time=time.time(),
+                    model=model,
+                    session_id=session_id,
+                )
+            raise
+        except Exception as exc:
+            if not managed_by_agent:
+                await self._record_provider_stat(
+                    request_kind=request_kind,
+                    status="error",
+                    usage=getattr(exc, "_astrbot_token_usage", None),
+                    start_time=start_time,
+                    end_time=time.time(),
+                    model=model,
+                    session_id=session_id,
+                )
+            raise
+
+        if final_response is None:
+            raise Exception("Codex backend stream did not produce a final response")
+        if not managed_by_agent:
+            await self._record_provider_stat(
+                request_kind=request_kind,
+                status="error" if final_response.role == "err" else "completed",
+                usage=final_response.usage,
+                start_time=start_time,
+                end_time=time.time(),
+                model=model,
+                session_id=session_id,
+            )

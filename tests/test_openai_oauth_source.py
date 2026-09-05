@@ -1335,18 +1335,22 @@ async def test_text_chat_skips_provider_record_when_agent_owns_stats(
 
 @pytest.mark.asyncio
 async def test_text_chat_stream_records_one_provider_call(
-    monkeypatch,
     provider_stat_writer,
 ):
-    async def fake_text_chat(_self, **kwargs):
-        return LLMResponse(
-            role="assistant",
-            completion_text="pong",
-            usage=TokenUsage(input_other=2, output=1),
-        )
-
-    monkeypatch.setattr(ProviderOpenAIOfficial, "text_chat", fake_text_chat)
     provider = _make_provider()
+
+    async def fake_events(_payload):
+        yield {"type": "response.output_text.delta", "delta": "pong"}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "response-1",
+                "output_text": "pong",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        }
+
+    provider._stream_backend_events = fake_events
     try:
         responses = [
             response
@@ -1356,7 +1360,10 @@ async def test_text_chat_stream_records_one_provider_call(
             )
         ]
 
-        assert len(responses) == 1
+        assert len(responses) == 2
+        assert responses[0].is_chunk is True
+        assert responses[1].is_chunk is False
+        assert responses[1].completion_text == "pong"
         provider_stat_writer.assert_awaited_once()
         assert provider_stat_writer.await_args.kwargs["umo"] == "stream-session"
     finally:
@@ -2012,10 +2019,18 @@ data: {"type":"response.completed","response":{"id":"resp_test","object":"respon
 @pytest.mark.asyncio
 async def test_text_chat_stream_preserves_provider_positional_arguments():
     provider = _make_provider()
-    provider.text_chat = AsyncMock(
-        return_value=LLMResponse(role="assistant", completion_text="ok")
+    provider._prepare_chat_payload = AsyncMock(
+        return_value=({"model": "model", "messages": []}, [])
     )
-    tool = SimpleNamespace()
+    captured = []
+
+    async def fake_query_stream(payloads, tools, *, request_max_retries=None):
+        captured.append((payloads, tools, request_max_retries))
+        yield LLMResponse(role="assistant", completion_text="ok")
+
+    provider._query_stream = fake_query_stream
+    provider._record_provider_stat = AsyncMock()
+    tool = SimpleNamespace(empty=lambda: False)
     tool_result = SimpleNamespace()
     extra_parts = [SimpleNamespace()]
     try:
@@ -2038,19 +2053,26 @@ async def test_text_chat_stream_preserves_provider_positional_arguments():
         ]
 
         assert len(responses) == 1
-        provider.text_chat.assert_awaited_once_with(
-            prompt="prompt",
-            session_id="session",
-            image_urls=["image"],
-            audio_urls=["audio"],
-            func_tool=tool,
-            contexts=[{"role": "user", "content": "message"}],
-            system_prompt="system",
-            tool_calls_result=tool_result,
+        provider._prepare_chat_payload.assert_awaited_once_with(
+            "prompt",
+            ["image"],
+            ["audio"],
+            [{"role": "user", "content": "message"}],
+            "system",
+            tool_result,
             model="model",
             extra_user_content_parts=extra_parts,
-            tool_choice="required",
-            request_max_retries=2,
         )
+        assert captured == [
+            (
+                {
+                    "model": "model",
+                    "messages": [],
+                    "tool_choice": "required",
+                },
+                tool,
+                2,
+            )
+        ]
     finally:
         await provider.terminate()
