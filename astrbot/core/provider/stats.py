@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,14 @@ def _runner_status(response: LLMResponse | None, aborted: bool) -> str:
     if response is None or response.role == "err":
         return "error"
     return "completed"
+
+
+def _token_usage_dict(usage: TokenUsage) -> dict[str, int]:
+    return {
+        "input_other": usage.input_other,
+        "input_cached": usage.input_cached,
+        "output": usage.output,
+    }
 
 
 async def record_agent_runner_stats(
@@ -73,7 +82,7 @@ async def record_agent_runner_stats(
                 provider_model=segment.provider.get_model(),
                 status=segment.status,
                 stats={
-                    "token_usage": segment.usage.__dict__.copy(),
+                    "token_usage": _token_usage_dict(segment.usage),
                     "start_time": segment.start_time,
                     "end_time": segment.end_time,
                     "time_to_first_token": 0.0,
@@ -99,6 +108,14 @@ async def record_agent_runner_stats(
                 0.0,
                 aggregate_stats["time_to_first_token"]
                 - (aggregate_start - original_start),
+            )
+        if (
+            aggregate_stats["end_time"] <= 0
+            or aggregate_stats["end_time"] < aggregate_stats["start_time"]
+        ):
+            aggregate_stats["end_time"] = max(
+                time.time(),
+                aggregate_stats["start_time"],
             )
 
         await db.insert_provider_stat(
@@ -143,7 +160,7 @@ async def record_llm_response_stats(
             provider_model=provider.get_model(),
             status=_response_status(response),
             stats={
-                "token_usage": effective_usage.__dict__.copy(),
+                "token_usage": _token_usage_dict(effective_usage),
                 "start_time": start_time,
                 "end_time": end_time,
                 "time_to_first_token": 0.0,
