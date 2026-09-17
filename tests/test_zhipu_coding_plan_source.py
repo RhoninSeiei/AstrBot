@@ -258,7 +258,7 @@ async def test_non_stream_request_uses_reasoning_policy_without_openclaw_identit
         "User-Agent": DEFAULT_USER_AGENT,
         "X-Test-Header": "test-value",
     }
-    assert "User-Agent" not in provider.custom_headers
+    assert "OpenClaw" not in provider.custom_headers["User-Agent"]
 
 
 @pytest.mark.asyncio
