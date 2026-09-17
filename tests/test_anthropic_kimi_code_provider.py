@@ -171,8 +171,8 @@ def test_create_http_client_uses_anthropic_httpx_module(monkeypatch):
     # the same way the production code does so the assertion stays version-agnostic.
     expected_httpx_module = getattr(
         anthropic_base_client,
-        "httpx",
-        getattr(anthropic_base_client, "httpx2", None),
+        "httpx2",
+        getattr(anthropic_base_client, "httpx", None),
     )
 
     assert captured["provider_label"] == "Anthropic"

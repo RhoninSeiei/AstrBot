@@ -209,6 +209,24 @@ export const useExtensionPage = (initialTab = "installed") => {
   const marketSearch = ref("");
   const debouncedMarketSearch = ref("");
   const refreshingMarket = ref(false);
+  const getInitialMarketListViewMode = () => {
+    if (typeof window !== "undefined" && window.localStorage) {
+      return localStorage.getItem("pluginMarketListViewMode") === "true";
+    }
+    return false;
+  };
+  const marketIsListView = ref(getInitialMarketListViewMode());
+  const getInitialMarketItemsPerPage = () => {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const rawValue = Number(localStorage.getItem("pluginMarketItemsPerPage"));
+      if ([9, 25, 50, 100].includes(rawValue)) {
+        return rawValue;
+      }
+    }
+    return 9;
+  };
+  const marketItemsPerPageOptions = [9, 25, 50, 100];
+  const marketItemsPerPage = ref(getInitialMarketItemsPerPage());
   const sortBy = ref("default"); // default, stars, downloads, author, updated
   const sortOrder = ref("desc"); // desc (降序) or asc (升序)
   const randomPluginNames = ref([]);
@@ -307,6 +325,39 @@ export const useExtensionPage = (initialTab = "installed") => {
 
     return items;
   });
+
+  const marketPluginHeaders = computed(() => [
+    {
+      title: tm("table.headers.name"),
+      key: "name",
+      sortable: false,
+      width: "26%",
+    },
+    {
+      title: tm("table.headers.description"),
+      key: "desc",
+      sortable: false,
+      width: "40%",
+    },
+    {
+      title: tm("table.headers.version"),
+      key: "version",
+      sortable: false,
+      width: "12%",
+    },
+    {
+      title: tm("table.headers.author"),
+      key: "author",
+      sortable: false,
+      width: "10%",
+    },
+    {
+      title: tm("table.headers.actions"),
+      key: "actions",
+      sortable: false,
+      width: "12%",
+    },
+  ]);
 
   // 过滤要显示的插件
   const filteredExtensions = computed(() => {
@@ -468,15 +519,15 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   // 分页计算属性
-  const displayItemsPerPage = 9; // 固定每页显示9个卡片（3行）
+  const displayItemsPerPage = computed(() => marketItemsPerPage.value);
 
   const totalPages = computed(() => {
-    return Math.ceil(sortedPlugins.value.length / displayItemsPerPage);
+    return Math.ceil(sortedPlugins.value.length / displayItemsPerPage.value);
   });
 
   const paginatedPlugins = computed(() => {
-    const start = (currentPage.value - 1) * displayItemsPerPage;
-    const end = start + displayItemsPerPage;
+    const start = (currentPage.value - 1) * displayItemsPerPage.value;
+    const end = start + displayItemsPerPage.value;
     return sortedPlugins.value.slice(start, end);
   });
 
@@ -2501,6 +2552,19 @@ export const useExtensionPage = (initialTab = "installed") => {
     }
   });
 
+  watch(marketIsListView, (newVal) => {
+    if (typeof window !== "undefined" && window.localStorage) {
+      localStorage.setItem("pluginMarketListViewMode", String(newVal));
+    }
+  });
+
+  watch(marketItemsPerPage, (newVal) => {
+    currentPage.value = 1;
+    if (typeof window !== "undefined" && window.localStorage) {
+      localStorage.setItem("pluginMarketItemsPerPage", String(newVal));
+    }
+  });
+
   watch(
     marketCategoryItems,
     (newItems) => {
@@ -2579,6 +2643,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     upload_file,
     uploadTab,
     showPluginFullName,
+    marketIsListView,
     marketSearch,
     debouncedMarketSearch,
     refreshingMarket,
@@ -2590,6 +2655,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     getMarketPluginId,
     getMarketPluginKey,
     toInitials,
+    marketPluginHeaders,
     filteredExtensions,
     filteredPlugins,
     filteredMarketPlugins,
@@ -2598,6 +2664,8 @@ export const useExtensionPage = (initialTab = "installed") => {
     randomPlugins,
     shufflePlugins,
     refreshRandomPlugins,
+    marketItemsPerPage,
+    marketItemsPerPageOptions,
     displayItemsPerPage,
     totalPages,
     paginatedPlugins,

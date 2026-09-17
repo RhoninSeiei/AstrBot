@@ -23,12 +23,17 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v7
-      
+        with:
+          python-version: '3.12'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov
-          pip install --editable .
+          python -m pip install uv
+          uv sync --dev
+
+      - name: Install audio test dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Run tests
         run: |
@@ -37,7 +42,7 @@ jobs:
           mkdir -p data/temp
           export TESTING=true
           export ZHIPU_API_KEY=${{ secrets.OPENAI_API_KEY }}
-          pytest --cov=astrbot -v -o log_cli=true -o log_level=DEBUG
+          uv run pytest --cov=astrbot -v
 
       - name: Upload results to Codecov
         if: github.repository == 'AstrBotDevs/AstrBot'
