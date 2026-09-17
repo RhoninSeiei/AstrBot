@@ -13,8 +13,8 @@ from astrbot.core.message.message_event_result import MessageChain
 from ..registry import builtin_tool
 from .util import (
     check_admin_permission,
-    is_local_runtime,
     format_exception_message,
+    is_local_runtime,
     workspace_root_for_context,
 )
 

@@ -107,5 +107,6 @@ async def test_unreset_runner_skips_stats_and_preserves_early_exit(
     else:
         assert image_calls == 2
         event.send.assert_awaited_once()
-        assert "second image preparation failed" in str(event.send.await_args)
-        assert "runner was not reset" not in str(event.send.await_args)
+        error_text = event.send.await_args.args[0].chain[0].text
+        assert "second image preparation failed" in error_text
+        assert "runner was not reset" not in error_text

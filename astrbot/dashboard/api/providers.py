@@ -707,7 +707,9 @@ async def complete_dashboard_alias_provider_source_openai_oauth(
             message="OpenAI OAuth binding completed",
         )
     except ValueError:
-        return _alias_error("OpenAI OAuth binding failed; check the authorization input")
+        return _alias_error(
+            "OpenAI OAuth binding failed; check the authorization input"
+        )
 
 
 @legacy_router.post("/provider_sources/openai_oauth/refresh")

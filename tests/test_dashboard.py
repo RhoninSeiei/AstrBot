@@ -2577,6 +2577,14 @@ async def test_plugins(
         assert isinstance(installed_at, str)
         datetime.fromisoformat(installed_at)
 
+    # Keep this route integration test independent of the public registry.
+    market_data = {"test_plugin": {"name": "test_plugin", "version": "1.0.0"}}
+
+    async def mock_registry(_self, *, custom_registry, force_refresh):
+        return market_data, None
+
+    monkeypatch.setattr(PluginService, "get_online_plugins", mock_registry)
+
     # 插件市场
     response = await test_client.get(
         "/api/plugin/market_list",
