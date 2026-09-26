@@ -66,6 +66,19 @@ These controls stay attached to every model call in the agent run, including
 function-result rounds, schema repair calls and fallback providers. A 429 error
 retains `status_code=429` on the final `LLMResponse` when fallback is disabled.
 
+## Read-only quota query
+
+The built-in `/codex_oauth_usage` command and `codex_oauth_usage` LLM tool
+read the configured Codex OAuth account's usage. An administrator in the
+current configuration profile can use them in private chats or any group;
+ordinary members cannot query the account. Authorization requires both the
+event's administrator role and its sender ID in the current profile's
+`admins_id` list, checked again after provider lookup and after the usage
+request. The legacy
+`group_allowlist` value is retained in existing configuration files but no
+longer controls this quota query. These rules do not change image generation
+or editing permissions.
+
 ## Experimental image generation and editing model request
 
 The ChatGPT/Codex OAuth source has an optional, experimental `oauth_image_model` setting.
