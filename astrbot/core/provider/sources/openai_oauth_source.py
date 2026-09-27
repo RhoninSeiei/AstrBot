@@ -1032,6 +1032,15 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
     def _extract_response_usage(self, usage: Any) -> TokenUsage | None:
         if usage is None:
             return None
+        getter = (
+            usage.get
+            if isinstance(usage, dict)
+            else lambda key: getattr(usage, key, None)
+        )
+        known_input = getter("input_tokens") is not None
+        known_output = getter("output_tokens") is not None
+        if not known_input and not known_output:
+            return None
         if isinstance(usage, dict):
             input_tokens = int(usage.get("input_tokens", 0) or 0)
             output_tokens = int(usage.get("output_tokens", 0) or 0)
@@ -1046,6 +1055,7 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
             input_other=max(0, input_tokens - cached_tokens),
             input_cached=cached_tokens,
             output=output_tokens,
+            is_partial=not (known_input and known_output),
         )
 
     async def _record_provider_stat(
@@ -1070,6 +1080,20 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
             model: Explicit request model when supplied.
             session_id: Session identifier when supplied by the caller.
         """
+        if getattr(self, "_usage_recording_enabled", False):
+            from astrbot.core.provider.usage_recorder import record_usage
+
+            await record_usage(
+                self,
+                self._usage_recording_db,
+                usage=usage,
+                status=status,
+                start_time=start_time,
+                end_time=end_time,
+                request_kind=request_kind,
+                model=model,
+            )
+            return
         try:
             provider_id = str(self.provider_config.get("id") or self.meta().id)
             await db_helper.insert_provider_stat(
@@ -1951,39 +1975,62 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     "stream": True,
                     "store": False,
                 }
-                if transport == "websocket":
-                    response = await self._request_image_backend_websocket(
-                        payload, timeout=timeout
-                    )
-                elif timeout is not None:
-                    response = await asyncio.wait_for(
-                        self._request_image_backend(payload), timeout=timeout
-                    )
-                else:
-                    response = await self._request_image_backend(payload)
-                response_usage = self._extract_response_usage(response.get("usage"))
-                if response_usage is not None:
-                    total_usage = total_usage + response_usage
-                results.extend(await self._extract_generated_images(response))
+                image_start = time.time()
+                response_usage = None
+                image_status = "completed"
+                response = {}
+                try:
+                    if transport == "websocket":
+                        response = await self._request_image_backend_websocket(
+                            payload, timeout=timeout
+                        )
+                    elif timeout is not None:
+                        response = await asyncio.wait_for(
+                            self._request_image_backend(payload), timeout=timeout
+                        )
+                    else:
+                        response = await self._request_image_backend(payload)
+                    response_usage = self._extract_response_usage(response.get("usage"))
+                    if response_usage is not None:
+                        total_usage = total_usage + response_usage
+                    results.extend(await self._extract_generated_images(response))
+                except asyncio.CancelledError:
+                    image_status = "aborted"
+                    raise
+                except Exception:
+                    image_status = "error"
+                    raise
+                finally:
+                    if getattr(self, "_usage_recording_enabled", False):
+                        await self._record_provider_stat(
+                            request_kind="image",
+                            status=image_status,
+                            usage=response_usage,
+                            start_time=image_start,
+                            end_time=time.time(),
+                            model=response.get("model") or model,
+                        )
         except (Exception, asyncio.CancelledError):
+            if not getattr(self, "_usage_recording_enabled", False):
+                await self._record_provider_stat(
+                    request_kind="image",
+                    status="error",
+                    usage=total_usage,
+                    start_time=start_time,
+                    end_time=time.time(),
+                    model=model,
+                )
+            raise
+
+        if not getattr(self, "_usage_recording_enabled", False):
             await self._record_provider_stat(
                 request_kind="image",
-                status="error",
+                status="completed",
                 usage=total_usage,
                 start_time=start_time,
                 end_time=time.time(),
                 model=model,
             )
-            raise
-
-        await self._record_provider_stat(
-            request_kind="image",
-            status="completed",
-            usage=total_usage,
-            start_time=start_time,
-            end_time=time.time(),
-            model=model,
-        )
         return results
 
     def _build_image_generation_input(

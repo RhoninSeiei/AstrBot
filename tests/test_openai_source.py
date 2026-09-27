@@ -1,6 +1,7 @@
 import base64
 import builtins
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -15,8 +16,6 @@ from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.sources.groq_source import ProviderGroq
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
-from pathlib import Path
-
 from astrbot.core.utils.media_utils import ResolvedMediaData, file_uri_to_path
 
 
@@ -24,6 +23,29 @@ class _ErrorWithBody(Exception):
     def __init__(self, message: str, body: dict):
         super().__init__(message)
         self.body = body
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 30}},
+        SimpleNamespace(
+            completion_tokens=5, prompt_tokens_details=SimpleNamespace(cached_tokens=30)
+        ),
+    ],
+)
+def test_partial_usage_preserves_known_cached_input(raw):
+    provider = ProviderOpenAIOfficial.__new__(ProviderOpenAIOfficial)
+    usage = provider._extract_usage(raw)
+    assert usage.input_other == 0
+    assert usage.input_cached == 30
+    assert usage.total == 35
+    assert usage.is_partial
+
+
+def test_empty_usage_is_unknown():
+    provider = ProviderOpenAIOfficial.__new__(ProviderOpenAIOfficial)
+    assert provider._extract_usage({}) is None
 
 
 class _ErrorWithResponse(Exception):

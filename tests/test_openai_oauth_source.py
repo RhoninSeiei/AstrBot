@@ -30,6 +30,85 @@ _IMAGE_MODEL_ALIASES = (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({}, "missing"),
+        ({"input_tokens": 8}, "partial"),
+        ({"input_tokens": 0, "output_tokens": 0}, "reported"),
+    ],
+)
+async def test_managed_oauth_usage_completeness(raw, expected):
+    from astrbot.core.provider.usage_recorder import instrument_provider
+
+    provider = _make_provider()
+    writer = AsyncMock()
+    instrument_provider(provider, SimpleNamespace(insert_provider_stat=writer))
+    provider._request_image_backend = AsyncMock(return_value={"usage": raw})
+    provider._extract_generated_images = AsyncMock(return_value=[])
+    try:
+        await provider.generate_image("draw")
+        assert writer.await_args.kwargs["stats"]["usage_status"] == expected
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_managed_oauth_test_is_classified_as_test():
+    from astrbot.core.provider.usage_recorder import instrument_provider
+
+    provider = _make_provider()
+    writer = AsyncMock()
+    provider._request_backend = AsyncMock(
+        return_value={
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "PONG"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+    instrument_provider(provider, SimpleNamespace(insert_provider_stat=writer))
+    try:
+        await provider.test()
+        assert writer.await_count == 1
+        assert writer.await_args.kwargs["stats"]["request_kind"] == "test"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_managed_image_records_each_backend_generation_and_missing_usage():
+    from astrbot.core.provider.usage_recorder import instrument_provider, usage_scope
+
+    provider = _make_provider({"provider_source_id": "oauth-source"})
+    writer = AsyncMock()
+    instrument_provider(provider, SimpleNamespace(insert_provider_stat=writer))
+    provider._request_image_backend = AsyncMock(
+        side_effect=[
+            {"usage": {"input_tokens": 12, "output_tokens": 6}},
+            {},
+        ]
+    )
+    provider._extract_generated_images = AsyncMock(return_value=[])
+    try:
+        with usage_scope(session_umo="qq:GroupMessage:example", plugin_id="matoi"):
+            await provider.generate_image("draw", n=2)
+        assert writer.await_count == 2
+        first, second = [call.kwargs for call in writer.await_args_list]
+        assert first["stats"]["usage_status"] == "reported"
+        assert first["stats"]["token_usage"]["output"] == 6
+        assert second["stats"]["usage_status"] == "missing"
+        assert first["stats"]["request_kind"] == "image"
+        assert first["stats"]["plugin_id"] == "matoi"
+        assert first["stats"]["request_id"] != second["stats"]["request_id"]
+    finally:
+        await provider.terminate()
+
+
 def _jwt_with_claims(claims: dict) -> str:
     header = {"alg": "none", "typ": "JWT"}
 
