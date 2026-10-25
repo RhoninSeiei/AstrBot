@@ -35,6 +35,9 @@ jobs:
       - name: Install audio test dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
+      - name: Diagnose Linux audio converter resources
+        run: uv run python scripts/diagnose_audio_converter.py
+
       - name: Run tests
         run: |
           mkdir -p data/plugins

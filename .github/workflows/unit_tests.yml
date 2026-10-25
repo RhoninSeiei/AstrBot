@@ -80,6 +80,10 @@ jobs:
           fi
           ffmpeg -version
 
+      - name: Diagnose Linux audio converter resources
+        if: runner.os == 'Linux'
+        run: uv run python scripts/diagnose_audio_converter.py
+
       - name: Diagnose macOS converter address space
         if: runner.os == 'macOS'
         run: |
