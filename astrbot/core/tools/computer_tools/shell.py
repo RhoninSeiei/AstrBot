@@ -19,6 +19,7 @@ from ..registry import builtin_tool
 from .fs import _read_allowed_roots, _write_allowed_roots
 from .util import (
     check_local_execution_permission,
+    format_exception_message,
     get_local_permission_policy,
     is_local_runtime,
     workspace_root_for_context,
@@ -216,8 +217,7 @@ class ExecuteShellTool(FunctionTool):
                 )
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
-            detail = str(e) or type(e).__name__
-            return f"Error executing command: {detail}"
+            return f"Error executing command: {format_exception_message(e)}"
 
 
 @dataclass

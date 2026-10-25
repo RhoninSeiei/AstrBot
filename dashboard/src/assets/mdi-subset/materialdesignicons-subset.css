@@ -1,4 +1,4 @@
-/* Auto-generated MDI subset – 268 icons */
+/* Auto-generated MDI subset – 270 icons */
 /* Do not edit manually. Run: pnpm run subset-icons */
 
 @font-face {
@@ -668,6 +668,10 @@
   content: "\F16B2";
 }
 
+.mdi-login-variant::before {
+  content: "\F05FC";
+}
+
 .mdi-logout::before {
   content: "\F0343";
 }
@@ -1058,6 +1062,10 @@
 
 .mdi-view-grid-outline::before {
   content: "\F11D9";
+}
+
+.mdi-view-list::before {
+  content: "\F0572";
 }
 
 .mdi-volume-high::before {

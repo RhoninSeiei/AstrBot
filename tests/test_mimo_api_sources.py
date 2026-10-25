@@ -1,9 +1,11 @@
 import asyncio
 import base64
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import astrbot.core.provider.sources.stepfun_asr_source as stepfun_asr_source
 from astrbot.core.provider.sources.mimo_api_common import (
     MiMoAPIError,
     _validate_wav_payload,
@@ -368,6 +370,46 @@ async def test_mimo_stt_prepare_audio_input_returns_data_url(monkeypatch):
 
     assert audio_data == MIMO_STT_TEST_AUDIO_DATA_URL
     assert cleanup_paths == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["download", "conversion"])
+async def test_stepfun_asr_preprocessing_cleans_temp_files_after_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    temp_dir = tmp_path / "stepfun-temp"
+    temp_dir.mkdir()
+    monkeypatch.setattr(stepfun_asr_source, "get_temp_dir", lambda: temp_dir)
+
+    if failure_stage == "download":
+
+        async def fail_download(_url: str, target_path: str) -> None:
+            Path(target_path).write_bytes(b"partial download")
+            raise RuntimeError("download failed")
+
+        monkeypatch.setattr(stepfun_asr_source, "download_file", fail_download)
+        audio_source = "https://example.test/recording.wav"
+        expected_error = "download failed"
+    else:
+        audio_path = tmp_path / "recording.flac"
+        audio_path.write_bytes(b"fLaC")
+
+        async def fail_conversion(_source_path: str, target_path: str) -> None:
+            Path(target_path).write_bytes(b"partial conversion")
+            raise RuntimeError("conversion failed")
+
+        monkeypatch.setattr(
+            stepfun_asr_source,
+            "convert_audio_to_wav",
+            fail_conversion,
+        )
+        audio_source = str(audio_path)
+        expected_error = "conversion failed"
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        await stepfun_asr_source.prepare_audio_input(audio_source)
+
+    assert list(temp_dir.iterdir()) == []
 
 
 @pytest.mark.asyncio

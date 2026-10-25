@@ -2587,6 +2587,7 @@ async def test_plugins(
     }
     get_online_plugins = AsyncMock(return_value=(market_plugins, None))
     monkeypatch.setattr(PluginService, "get_online_plugins", get_online_plugins)
+
     response = await test_client.get(
         "/api/plugin/market_list",
         headers=authenticated_header,

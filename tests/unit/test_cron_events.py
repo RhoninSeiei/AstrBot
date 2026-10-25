@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from astrbot import logger
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
@@ -96,8 +97,13 @@ async def test_missing_platform_does_not_record_send(cron_event, caplog):
     context.platform_manager = SimpleNamespace(platform_insts=[])
     event.context_obj = context
 
-    await event.send(MessageChain().message("result"))
-    await asyncio.sleep(0)
+    # Capture AstrBot's non-propagating logger before it forwards to Loguru.
+    logger.addHandler(caplog.handler)
+    try:
+        await event.send(MessageChain().message("result"))
+        await asyncio.sleep(0)
+    finally:
+        logger.removeHandler(caplog.handler)
 
     assert event._has_send_oper is False
     metric.assert_not_awaited()

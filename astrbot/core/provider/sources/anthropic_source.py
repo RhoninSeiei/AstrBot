@@ -29,7 +29,11 @@ from astrbot.core.utils.network_utils import (
 
 from ..headers import build_conversation_headers, build_provider_headers
 from ..register import register_provider_adapter
-from .request_retry import retry_provider_request, retry_provider_request_context
+from .request_retry import (
+    provider_retry_rate_limits,
+    retry_provider_request,
+    retry_provider_request_context,
+)
 
 
 @register_provider_adapter(
@@ -137,13 +141,11 @@ class ProviderAnthropic(Provider):
         try:
             from anthropic import _base_client as anthropic_base_client
 
-            # anthropic <1.0.0 exposes the bundled httpx as ``_base_client.httpx``;
-            # 1.0.0+ renamed it to ``_base_client.httpx2``. Prefer the SDK's own
-            # module in either case and fall back to the global httpx import.
+            # Prefer the SDK's own HTTP client module across Anthropic versions.
             httpx_module = getattr(
                 anthropic_base_client,
-                "httpx",
-                getattr(anthropic_base_client, "httpx2", httpx),
+                "httpx2",
+                getattr(anthropic_base_client, "httpx", httpx),
             )
         except ImportError:
             pass
@@ -445,9 +447,9 @@ class ProviderAnthropic(Provider):
             sanitized
         )
 
-    def _extract_usage(self, usage: Usage | None) -> TokenUsage:
+    def _extract_usage(self, usage: Usage | None) -> TokenUsage | None:
         if usage is None:
-            return TokenUsage()
+            return None
         # https://docs.claude.com/en/docs/build-with-claude/prompt-caching#tracking-cache-performance
         # Anthropic's input_tokens excludes cache served reads AND writes, so
         # cache_creation_input_tokens must be added back into input_other to
@@ -552,9 +554,21 @@ class ProviderAnthropic(Provider):
         self._sanitize_assistant_messages(payloads)
 
         try:
+            request_client = self.client
+            if not provider_retry_rate_limits.get():
+                request_client = self.client.with_options()
+                sdk_should_retry = request_client._should_retry
+
+                def should_retry(response: httpx.Response) -> bool:
+                    if response.status_code == 429:
+                        return False
+                    return sdk_should_retry(response)
+
+                request_client._should_retry = should_retry
+
             completion = await retry_provider_request(
                 "Anthropic",
-                lambda: self.client.messages.create(
+                lambda: request_client.messages.create(
                     **payloads,
                     stream=False,
                     extra_body=extra_body,
@@ -646,7 +660,7 @@ class ProviderAnthropic(Provider):
         final_text = ""
         final_tool_calls = []
         id = None
-        usage = TokenUsage()
+        usage = None
         extra_body = self.provider_config.get("custom_extra_body") or {}
         if not isinstance(extra_body, dict):
             extra_body = {}
@@ -670,9 +684,21 @@ class ProviderAnthropic(Provider):
         self._apply_thinking_config(payloads)
         self._sanitize_assistant_messages(payloads)
 
+        request_client = self.client
+        if not provider_retry_rate_limits.get():
+            request_client = self.client.with_options()
+            sdk_should_retry = request_client._should_retry
+
+            def should_retry(response: httpx.Response) -> bool:
+                if response.status_code == 429:
+                    return False
+                return sdk_should_retry(response)
+
+            request_client._should_retry = should_retry
+
         async with retry_provider_request_context(
             "Anthropic",
-            lambda: self.client.messages.stream(
+            lambda: request_client.messages.stream(
                 **payloads,
                 extra_body=extra_body,
                 extra_headers=build_conversation_headers(conversation_id),
@@ -782,6 +808,8 @@ class ProviderAnthropic(Provider):
 
                 elif event.type == "message_delta":
                     if event.usage:
+                        if usage is None:
+                            usage = TokenUsage(is_partial=True)
                         self._update_usage(usage, event.usage)
 
         # 返回最终的完整结果
