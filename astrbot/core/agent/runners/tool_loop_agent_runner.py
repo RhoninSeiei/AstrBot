@@ -5,7 +5,7 @@ import time
 import traceback
 import typing as T
 import uuid
-from contextlib import suppress
+from contextlib import aclosing, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -19,7 +19,7 @@ from mcp.types import (
 )
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -39,13 +39,21 @@ from astrbot.core.persona_error_reply import (
 from astrbot.core.provider.entities import (
     LLMResponse,
     ProviderRequest,
+    TokenUsage,
     ToolCallsResult,
 )
 from astrbot.core.provider.modalities import (
     log_context_sanitize_stats,
     sanitize_contexts_by_modalities,
 )
-from astrbot.core.provider.provider import Provider
+from astrbot.core.provider.provider import Provider, provider_stats_managed_by_agent
+from astrbot.core.provider.sources.request_retry import (
+    get_provider_request_status_code,
+    provider_oauth_web_search,
+    provider_retry_rate_limits,
+)
+from astrbot.core.provider.stats import ProviderStatSegment
+from astrbot.core.provider.usage_attribution import iter_with_usage
 from astrbot.core.utils.async_generator import iterate_in_task
 
 from ..context.compressor import ContextCompressor
@@ -230,6 +238,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         tool_schema_mode: str | None = "full",
         fallback_providers: list[Provider] | None = None,
         request_max_retries: int | None = None,
+        provider_stats_managed_by_agent: bool = False,
         tool_result_overflow_dir: str | None = None,
         read_tool: FunctionTool | None = None,
         **kwargs: T.Any,
@@ -244,6 +253,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.custom_token_counter = custom_token_counter
         self.custom_compressor = custom_compressor
         self.request_max_retries = request_max_retries
+        self.provider_stats_managed_by_agent = provider_stats_managed_by_agent
         self.tool_result_overflow_dir = tool_result_overflow_dir
         self.read_tool = read_tool
         self._tool_result_token_counter = EstimateTokenCounter()
@@ -330,6 +340,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         self.stats = AgentStats()
         self.stats.start_time = time.time()
+        self.provider_stat_segments: list[ProviderStatSegment] = []
+        self._provider_token_usage: dict[int, TokenUsage] = {}
+        self._provider_usage_start_times: dict[int, float] = {}
 
     def _read_tool_hint(self) -> str:
         if self.read_tool is not None:
@@ -464,6 +477,80 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             preview = preview[:next_len]
         return preview
 
+    @contextmanager
+    def _provider_stats_scope(self) -> T.Iterator[None]:
+        stats_token = provider_stats_managed_by_agent.set(
+            self.provider_stats_managed_by_agent
+        )
+        retry_token = provider_retry_rate_limits.set(self.req.retry_rate_limits)
+        search_token = provider_oauth_web_search.set(self.req.oauth_web_search)
+        try:
+            yield
+        finally:
+            provider_oauth_web_search.reset(search_token)
+            provider_retry_rate_limits.reset(retry_token)
+            provider_stats_managed_by_agent.reset(stats_token)
+
+    def _mark_provider_attempt_started(
+        self,
+        provider: Provider,
+        start_time: float,
+    ) -> float:
+        provider_key = id(provider)
+        return self._provider_usage_start_times.setdefault(provider_key, start_time)
+
+    def _accumulate_token_usage(
+        self,
+        usage: TokenUsage | None,
+        provider: Provider | None = None,
+    ) -> None:
+        if usage is None:
+            return
+        self.stats.token_usage += usage
+        usage_provider = provider or self.provider
+        provider_key = id(usage_provider)
+        provider_usage = self._provider_token_usage.get(provider_key, TokenUsage())
+        self._provider_token_usage[provider_key] = provider_usage + usage
+        self.stats.current_context_tokens = usage.input
+        if self.req and self.req.conversation:
+            self.req.conversation.token_usage = usage.total
+
+    def _settle_provider_stat_segment(
+        self,
+        provider: Provider,
+        *,
+        fallback_start_time: float,
+        end_time: float,
+    ) -> None:
+        provider_key = id(provider)
+        self.provider_stat_segments.append(
+            ProviderStatSegment(
+                provider=provider,
+                usage=self._provider_token_usage.pop(provider_key, TokenUsage()),
+                start_time=self._provider_usage_start_times.pop(
+                    provider_key,
+                    fallback_start_time,
+                ),
+                end_time=end_time,
+            )
+        )
+
+    async def _await_additional_provider_response(
+        self,
+        awaitable: T.Awaitable[LLMResponse],
+    ) -> LLMResponse | None:
+        with self._provider_stats_scope():
+            try:
+                response = await self._await_or_stop(awaitable)
+            except Exception as exc:
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if isinstance(failed_usage, TokenUsage):
+                    self._accumulate_token_usage(failed_usage)
+                raise
+        if response is not None:
+            self._accumulate_token_usage(response.usage)
+        return response
+
     async def _await_or_stop(
         self,
         awaitable: T.Awaitable[AwaitableResultT],
@@ -526,7 +613,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             try:
                 while True:
                     try:
-                        resp = await self._await_or_stop(anext(stream))  # type: ignore
+                        with self._provider_stats_scope():
+                            resp = await self._await_or_stop(anext(stream))  # type: ignore
                     except StopAsyncIteration:
                         return
                     if resp is None:
@@ -535,7 +623,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             finally:
                 await self._close_executor(stream)
         else:
-            resp = await self._await_or_stop(self.provider.text_chat(**payload))
+            with self._provider_stats_scope():
+                resp = await self._await_or_stop(self.provider.text_chat(**payload))
             if resp is not None:
                 yield resp
 
@@ -571,9 +660,19 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     candidate_id,
                 )
             self.provider = candidate
+            candidate_start_time = self._mark_provider_attempt_started(
+                candidate,
+                time.time(),
+            )
+            candidate_has_stream_output = False
             try:
                 retrying = AsyncRetrying(
-                    retry=retry_if_exception_type(EmptyModelOutputError),
+                    retry=retry_if_exception(
+                        lambda exc: (
+                            isinstance(exc, EmptyModelOutputError)
+                            and not candidate_has_stream_output
+                        )
+                    ),
                     stop=stop_after_attempt(self.EMPTY_OUTPUT_RETRY_ATTEMPTS),
                     wait=wait_exponential(
                         multiplier=1,
@@ -589,29 +688,48 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     has_stream_output = False
                     with attempt:
                         try:
-                            async for resp in self._iter_llm_responses(
-                                include_model=idx == 0
-                            ):
-                                if resp.is_chunk:
-                                    has_stream_output = True
+                            async with aclosing(
+                                self._iter_llm_responses(include_model=idx == 0)
+                            ) as responses:
+                                async for resp in responses:
+                                    if resp.is_chunk:
+                                        has_stream_output = True
+                                        candidate_has_stream_output = True
+                                        yield resp
+                                        continue
+
+                                    if (
+                                        resp.role == "err"
+                                        and not has_stream_output
+                                        and (not is_last_candidate)
+                                    ):
+                                        if (
+                                            resp.status_code == 429
+                                            and not self.req.fallback_on_rate_limit
+                                        ):
+                                            yield resp
+                                            return
+                                        last_err_response = resp
+                                        last_exception = None
+                                        failed_usage = resp.usage or TokenUsage()
+                                        self._accumulate_token_usage(
+                                            failed_usage,
+                                            candidate,
+                                        )
+                                        self._settle_provider_stat_segment(
+                                            candidate,
+                                            fallback_start_time=candidate_start_time,
+                                            end_time=time.time(),
+                                        )
+                                        logger.warning(
+                                            "Chat Model %s returns error response, trying fallback to next provider.",
+                                            candidate_id,
+                                        )
+                                        break
+
+                                    self._sanitize_malformed_tool_calls(resp)
                                     yield resp
-                                    continue
-
-                                if (
-                                    resp.role == "err"
-                                    and not has_stream_output
-                                    and (not is_last_candidate)
-                                ):
-                                    last_err_response = resp
-                                    logger.warning(
-                                        "Chat Model %s returns error response, trying fallback to next provider.",
-                                        candidate_id,
-                                    )
-                                    break
-
-                                self._sanitize_malformed_tool_calls(resp)
-                                yield resp
-                                return
+                                    return
 
                             if has_stream_output:
                                 return
@@ -633,12 +751,30 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
+                last_err_response = None
+                failed_usage = getattr(exc, "_astrbot_token_usage", None)
+                if not isinstance(failed_usage, TokenUsage):
+                    failed_usage = TokenUsage()
+                self._accumulate_token_usage(failed_usage, candidate)
+                if not is_last_candidate:
+                    self._settle_provider_stat_segment(
+                        candidate,
+                        fallback_start_time=candidate_start_time,
+                        end_time=time.time(),
+                    )
                 logger.warning(
                     "Chat Model %s request error: %s",
                     candidate_id,
                     exc,
                     exc_info=True,
                 )
+                if candidate_has_stream_output:
+                    break
+                if (
+                    get_provider_request_status_code(exc) == 429
+                    and not self.req.fallback_on_rate_limit
+                ):
+                    break
                 continue
 
         if last_err_response:
@@ -651,6 +787,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     "All chat models failed: "
                     f"{type(last_exception).__name__}: {last_exception}"
                 ),
+                status_code=get_provider_request_status_code(last_exception),
             )
             return
         yield LLMResponse(
@@ -805,6 +942,23 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
     @override
     async def step(self):
+        event = getattr(getattr(self.run_context, "context", None), "event", None)
+        request = self.req
+        iterator = iter_with_usage(
+            self._step(),
+            event=event,
+            plugin_id=getattr(request, "usage_plugin_id", None),
+            conversation_id=(
+                request.conversation.cid if request and request.conversation else None
+            ),
+        )
+        try:
+            async for response in iterator:
+                yield response
+        finally:
+            await iterator.aclose()
+
+    async def _step(self):
         """Process a single step of the agent.
         This method should return the result of the step.
         """
@@ -839,59 +993,61 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.run_context.messages = processed_messages
         self._simple_print_message_role("[AftCompact]", self.run_context.messages)
 
-        async for llm_response in self._iter_llm_responses_with_fallback():
-            if llm_response.is_chunk:
-                if self.stats.time_to_first_token == 0:
-                    self.stats.time_to_first_token = time.time() - self.stats.start_time
+        async with aclosing(self._iter_llm_responses_with_fallback()) as responses:
+            async for llm_response in responses:
+                if llm_response.is_chunk:
+                    if self.stats.time_to_first_token == 0:
+                        self.stats.time_to_first_token = (
+                            time.time() - self.stats.start_time
+                        )
 
-                if llm_response.reasoning_content:
-                    yield AgentResponse(
-                        type="streaming_delta",
-                        data=AgentResponseData(
-                            chain=MessageChain(type="reasoning").message(
-                                llm_response.reasoning_content,
+                    if llm_response.reasoning_content:
+                        yield AgentResponse(
+                            type="streaming_delta",
+                            data=AgentResponseData(
+                                chain=MessageChain(type="reasoning").message(
+                                    llm_response.reasoning_content,
+                                ),
                             ),
-                        ),
-                    )
-                if llm_response.result_chain:
-                    yield AgentResponse(
-                        type="streaming_delta",
-                        data=AgentResponseData(chain=llm_response.result_chain),
-                    )
-                elif llm_response.completion_text:
-                    yield AgentResponse(
-                        type="streaming_delta",
-                        data=AgentResponseData(
-                            chain=MessageChain().message(llm_response.completion_text),
-                        ),
-                    )
-                if self._is_stop_requested():
-                    break
-                continue
-            llm_resp_result = llm_response
+                        )
+                    if llm_response.result_chain:
+                        yield AgentResponse(
+                            type="streaming_delta",
+                            data=AgentResponseData(chain=llm_response.result_chain),
+                        )
+                    elif llm_response.completion_text:
+                        yield AgentResponse(
+                            type="streaming_delta",
+                            data=AgentResponseData(
+                                chain=MessageChain().message(
+                                    llm_response.completion_text
+                                ),
+                            ),
+                        )
+                    if self._is_stop_requested():
+                        break
+                    continue
+                llm_resp_result = llm_response
 
-            # Chunk responses have already continued above. A missing usage report
-            # means the latest context occupancy is unknown.
-            self.stats.current_context_tokens = 0
-            if llm_response.usage:
-                # Keep cumulative usage for billing and expose the latest request
-                # input separately for context-window occupancy displays.
-                self.stats.token_usage += llm_response.usage
-                self.stats.current_context_tokens = llm_response.usage.input
-                if self.req.conversation:
-                    self.req.conversation.token_usage = llm_response.usage.total
-            # end_time must be set before the yield serializes to_dict().
-            self.stats.end_time = time.time()
-            yield AgentResponse(
-                type="agent_stats",
-                data=AgentResponseData(
-                    chain=MessageChain(
-                        type="agent_stats",
-                        chain=[Json(data=self.stats.to_dict())],
-                    )
-                ),
-            )
-            break  # got final response
+                # Chunk responses have already continued above. A missing usage report
+                # means the latest context occupancy is unknown.
+                self.stats.current_context_tokens = 0
+                if llm_response.usage:
+                    # Keep cumulative usage for billing and expose the latest request
+                    # input separately for context-window occupancy displays.
+                    self._accumulate_token_usage(llm_response.usage)
+                # end_time must be set before the yield serializes to_dict().
+                self.stats.end_time = time.time()
+                yield AgentResponse(
+                    type="agent_stats",
+                    data=AgentResponseData(
+                        chain=MessageChain(
+                            type="agent_stats",
+                            chain=[Json(data=self.stats.to_dict())],
+                        )
+                    ),
+                )
+                break  # got final response
 
         if self._is_stop_requested():
             yield await self._finalize_aborted_step()
@@ -1499,7 +1655,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
-                requery_resp = await self._await_or_stop(
+                requery_resp = await self._await_additional_provider_response(
                     self.provider.text_chat(
                         contexts=self._sanitize_contexts_for_provider(contexts),
                         func_tool=param_subset,
@@ -1529,7 +1685,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
-                    repair_resp = await self._await_or_stop(
+                    repair_resp = await self._await_additional_provider_response(
                         self.provider.text_chat(
                             contexts=self._sanitize_contexts_for_provider(
                                 repair_contexts

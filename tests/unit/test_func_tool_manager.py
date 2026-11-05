@@ -126,6 +126,11 @@ async def test_local_execute_shell_manages_running_and_closed_results(
     allow_network,
 ):
     from astrbot.core.tools.computer_tools import shell as shell_tools
+    from astrbot.core.tools.computer_tools import util as computer_util
+
+    monkeypatch.setattr(
+        computer_util, "get_process_sandbox_status", lambda: {"status": "detected"}
+    )
 
     shell = LocalShellComponent()
     shell.exec_managed = AsyncMock(
@@ -500,6 +505,11 @@ async def test_shell_session_tool_passes_member_identity_to_session_actions(
     yield_time_ms,
 ):
     from astrbot.core.tools.computer_tools import shell as shell_tools
+    from astrbot.core.tools.computer_tools import util as computer_util
+
+    monkeypatch.setattr(
+        computer_util, "get_process_sandbox_status", lambda: {"status": "detected"}
+    )
 
     shell = LocalShellComponent()
     operation = AsyncMock(return_value={"session_id": "sh_test", "status": "running"})

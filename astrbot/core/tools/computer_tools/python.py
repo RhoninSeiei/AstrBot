@@ -16,6 +16,7 @@ from .fs import _read_allowed_roots, _write_allowed_roots
 from .util import (
     check_admin_permission,
     check_local_execution_permission,
+    format_exception_message,
     workspace_root_for_context,
 )
 
@@ -115,7 +116,7 @@ class PythonTool(FunctionTool):
             )
             return await handle_result(result, context.context.event)
         except Exception as e:
-            return f"Error executing code: {str(e)}"
+            return f"Error executing code: {format_exception_message(e)}"
 
 
 @builtin_tool(config=_LOCAL_PYTHON_TOOL_CONFIG)
@@ -182,4 +183,4 @@ class LocalPythonTool(FunctionTool):
             )
             return await handle_result(result, context.context.event)
         except Exception as e:
-            return f"Error executing code: {str(e)}"
+            return f"Error executing code: {format_exception_message(e)}"

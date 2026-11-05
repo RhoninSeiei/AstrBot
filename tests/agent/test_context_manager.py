@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from astrbot import logger
+
 # Add parent directory to path to avoid circular import issues
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -678,7 +680,13 @@ class TestContextManager:
         manager = ContextManager(config)
         messages = self._rounds_with_tool_chain("f" * 900)
 
-        result = await manager.process(messages)
+        # AstrBot forwards its non-propagating logger to Loguru, so root capture
+        # alone does not receive these records.
+        logger.addHandler(caplog.handler)
+        try:
+            result = await manager.process(messages)
+        finally:
+            logger.removeHandler(caplog.handler)
 
         assert result == [messages[0], messages[-1]]
         assert "only the latest round left" in caplog.text
