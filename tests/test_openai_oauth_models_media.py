@@ -67,6 +67,52 @@ async def test_extra_only_turn_and_audio_with_context_remain_present():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("with_metadata", [False, True])
+async def test_extra_image_with_context_remains_in_chat_and_codex_payload(
+    positional, with_metadata
+):
+    from astrbot.core.agent.message import ImageURLPart, TextPart
+
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (2, 2), "blue").save(image_bytes, format="PNG")
+    image_url = (
+        "data:image/png;base64," + base64.b64encode(image_bytes.getvalue()).decode()
+    )
+    extra = [ImageURLPart(image_url={"url": image_url})]
+    if with_metadata:
+        extra.insert(0, TextPart(text="sender metadata"))
+    provider = _make_provider()
+    context = [{"role": "user", "content": "earlier message"}]
+    try:
+        if positional:
+            payload, _ = await provider._prepare_chat_payload(
+                None, None, None, context, extra_user_content_parts=extra
+            )
+        else:
+            payload, _ = await provider._prepare_chat_payload(
+                None, contexts=context, extra_user_content_parts=extra
+            )
+        assert context == [{"role": "user", "content": "earlier message"}]
+        assert len(payload["messages"]) == 2
+        content = payload["messages"][-1]["content"]
+        images = [part for part in content if part["type"] == "image_url"]
+        assert len(images) == 1
+        with Image.open(
+            io.BytesIO(base64.b64decode(images[0]["image_url"]["url"].split(",", 1)[1]))
+        ) as resolved_image:
+            assert resolved_image.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
+        params = provider._build_responses_params(payload, None)
+        assert any(
+            part["type"] == "input_image" for part in params["input"][-1]["content"]
+        )
+        if with_metadata:
+            assert any(part.get("text") == "sender metadata" for part in content)
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh", "max"])
 async def test_terra_reasoning_and_sampling_parameters(effort):
     provider = _make_provider(
@@ -147,6 +193,59 @@ async def test_models_discovery_filters_catalog_and_caches_requests(monkeypatch)
         )
         assert requests[0].headers["authorization"] == "Bearer test-token"
     finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["normal", "timeout", "cancel"])
+async def test_python310_catalog_without_asyncio_timeout(monkeypatch, outcome):
+    provider = _make_provider()
+    requests = []
+    closed = []
+    started = asyncio.Event()
+    task = None
+
+    @asynccontextmanager
+    async def open_client(**kwargs):
+        async def handle(request):
+            requests.append(request)
+            started.set()
+            if outcome != "normal":
+                await asyncio.Event().wait()
+            return httpx.Response(
+                200, json={"models": [{"slug": "dynamic-python310-model"}]}
+            )
+
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handle)
+            ) as client:
+                yield client
+        finally:
+            closed.append(True)
+
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
+    monkeypatch.setattr(provider, "_open_oauth_http_client", open_client)
+    try:
+        if outcome == "normal":
+            assert await provider.get_models() == ["dynamic-python310-model"]
+        elif outcome == "timeout":
+            monkeypatch.setattr(oauth_source, "MODEL_CATALOG_TIMEOUT_SECONDS", 0.01)
+            assert await provider.get_models() == list(provider.model_capabilities)
+        else:
+            task = asyncio.create_task(provider.get_models())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not provider._oauth_shared_state.models_cache
+        assert len(requests) == 1
+        assert closed == [True]
+        assert not provider._oauth_shared_state.models_lock.locked()
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await provider.terminate()
 
 
