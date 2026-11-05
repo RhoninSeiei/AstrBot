@@ -1532,6 +1532,18 @@
         ]
       },
 
+      "oauth_image_model": {
+        "description": "Codex image model request (experimental)",
+        "hint": "Requests an image tool model without changing the main model. Defaults to gpt-image-2.6-sunburst; an explicitly empty value uses backend selection. The backend may ignore or replace the requested model, and may reject GIF output. Successful image generation does not confirm the selected model.",
+        "labels": [
+          "Backend selection",
+          "Images 2.0",
+          "Images 2.5 Flare",
+          "Images 2.5 Sunburst",
+          "Images 2.6 Flare",
+          "Images 2.6 Sunburst (default)"
+        ]
+      },
       "custom_headers": {
         "description": "Custom request headers",
         "hint": "Key/value pairs added here are merged into the OpenAI SDK default_headers for custom HTTP headers. Values must be strings."

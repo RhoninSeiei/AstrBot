@@ -1522,7 +1522,7 @@ class ProviderConfigService:
         """
         result = copy.deepcopy(source)
         if result.get("type") == "openai_oauth_chat_completion":
-            result.setdefault("oauth_image_model", "")
+            result.setdefault("oauth_image_model", "gpt-image-2.6-sunburst")
         return result
 
     def get_provider_schema(self) -> dict:
@@ -2006,6 +2006,10 @@ class ProviderConfigService:
         if cls_type is None or not issubclass(cls_type, Provider):
             raise ValueError(f"Provider source {source_id} does not support model list")
 
+        if provider_type == "openai_oauth_chat_completion":
+            source = self.provider_manager.get_merged_provider_config(
+                {"id": source_id, "provider_source_id": source_id}, runtime=True
+            )
         inst = cls_type(source, {})
         init_fn = getattr(inst, "initialize", None)
         if callable(init_fn):
