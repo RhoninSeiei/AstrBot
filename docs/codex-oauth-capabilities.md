@@ -328,9 +328,11 @@ including explicit zeros. Repeated snapshots replace known fields instead of
 adding them. A full snapshot may correct a previous value downward. Directional
 partial snapshots remain partial until an explicitly complete usage report is
 received. The hook is a no-op outside a managed request; providers supporting
-older AstrBot versions should import it optionally. A consumed final response
-takes precedence, preventing duplicate accounting. Early stream closure can
-retain a snapshot that the producer already observed.
+older AstrBot versions should import it optionally. A complete final usage report
+takes precedence, preventing duplicate accounting. A matching partial report can
+retain directions already observed for that response without changing the
+returned `LLMResponse.usage`. Early stream closure can retain a snapshot that the
+producer already observed.
 
 Realtime response snapshots are keyed by session and response identity and
 persisted asynchronously. Writes and close-time draining are bounded so a slow

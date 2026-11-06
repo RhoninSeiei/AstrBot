@@ -1230,3 +1230,129 @@ async def test_invalid_cancelled_exception_usage_remains_missing():
     assert (
         db.insert_provider_stat.await_args.kwargs["stats"]["usage_status"] == "missing"
     )
+
+
+def raw_partial_usage_events(zero, outcome, *, image=False):
+    events = [
+        {
+            "type": "response.created",
+            "response": {"id": "response-test", "usage": {"input_tokens": 4}},
+        },
+        {
+            "type": "response.in_progress",
+            "response": {"id": "response-test", "usage": {"output_tokens": 2}},
+        },
+    ]
+    if zero:
+        events.append(
+            {
+                "type": "response.in_progress",
+                "response": {"id": "response-test", "usage": {"input_tokens": 0}},
+            }
+        )
+    if image:
+        events.append(image_events()[2])
+    response = {"id": "response-test", "output": [], "output_text": "ok"}
+    if outcome == "full":
+        response["usage"] = {"input_tokens": 7, "output_tokens": 3}
+    elif outcome in {"partial", "error"}:
+        response["usage"] = {"output_tokens": 2}
+    if outcome == "error":
+        response["error"] = {"code": "invalid_request_error", "status_code": 400}
+    events.append(
+        {
+            "type": "response.failed" if outcome == "error" else "response.completed",
+            "response": response,
+        }
+    )
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("zero", [False, True])
+@pytest.mark.parametrize("outcome", ["partial", "missing", "error", "full"])
+async def test_raw_sse_presence_keeps_disjoint_usage_without_mutating_final(
+    monkeypatch, stream, zero, outcome
+):
+    provider, db = prepared_provider(monkeypatch)
+    body = "".join(
+        "data: " + json.dumps(event) + "\n\n"
+        for event in raw_partial_usage_events(zero, outcome)
+    )
+
+    @asynccontextmanager
+    async def client(**kwargs):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text=body)
+            )
+        ) as opened:
+            yield opened
+
+    monkeypatch.setattr(provider, "_open_oauth_http_client", client)
+    try:
+        if outcome == "error":
+            with pytest.raises(retry.ProviderRequestError):
+                if stream:
+                    _ = [
+                        response
+                        async for response in provider.text_chat_stream(
+                            "hello", request_max_retries=1
+                        )
+                    ]
+                else:
+                    await provider.text_chat("hello", request_max_retries=1)
+        else:
+            response = (
+                ([item async for item in provider.text_chat_stream("hello")])[-1]
+                if stream
+                else await provider.text_chat("hello")
+            )
+            if outcome == "partial":
+                assert response.usage.input == 0 and response.usage.output == 2
+                assert response.usage.is_partial
+            elif outcome == "missing":
+                assert response.usage is None
+            else:
+                assert response.usage.input == 7 and response.usage.output == 3
+        assert db.insert_provider_stat.await_count == 1
+        stats = db.insert_provider_stat.await_args.kwargs["stats"]
+        assert stats["token_usage"] == {
+            "input_other": 7 if outcome == "full" else 0 if zero else 4,
+            "input_cached": 0,
+            "output": 3 if outcome == "full" else 2,
+        }
+        assert stats["usage_status"] == ("reported" if outcome == "full" else "partial")
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("zero", [False, True])
+@pytest.mark.parametrize("outcome", ["partial", "missing", "error", "full"])
+async def test_raw_ws_presence_keeps_disjoint_usage_and_honors_explicit_zero(
+    monkeypatch, tmp_path, zero, outcome
+):
+    provider, db = prepared_provider(monkeypatch)
+    provider.provider_config["generated_image_dir"] = str(tmp_path)
+    install_sessions(
+        monkeypatch,
+        [Session(Socket(raw_partial_usage_events(zero, outcome, image=True)))],
+    )
+    try:
+        if outcome == "error":
+            with pytest.raises(source.OpenAIOAuthImageStreamError):
+                await provider.generate_image("cat", transport="websocket")
+        else:
+            assert len(await provider.generate_image("cat", transport="websocket")) == 1
+        assert db.insert_provider_stat.await_count == 1
+        stats = db.insert_provider_stat.await_args.kwargs["stats"]
+        assert stats["token_usage"] == {
+            "input_other": 7 if outcome == "full" else 0 if zero else 4,
+            "input_cached": 0,
+            "output": 3 if outcome == "full" else 2,
+        }
+        assert stats["usage_status"] == ("reported" if outcome == "full" else "partial")
+    finally:
+        await provider.terminate()

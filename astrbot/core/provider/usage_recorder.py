@@ -60,6 +60,7 @@ class UsageAttemptLedger:
         self.snapshot_terminal_received = False
         self.snapshot_response_id: str | None = None
         self.snapshot_reported_fields: frozenset[str] | None = None
+        self.snapshot_last_usage: TokenUsage | None = None
         self.closed = False
 
     def begin_attempt(self) -> None:
@@ -69,6 +70,7 @@ class UsageAttemptLedger:
         self.snapshot_terminal_received = False
         self.snapshot_response_id = None
         self.snapshot_reported_fields = None
+        self.snapshot_last_usage = None
 
     def note_failure(self, error: BaseException, *, new_attempt: bool = False) -> None:
         """Observe an exception once, even when several retry layers see it.
@@ -101,10 +103,29 @@ class UsageAttemptLedger:
         usage = getattr(error, "_astrbot_token_usage", None)
         if not _valid_token_usage(usage):
             usage = self.observed_usage
+        elif (
+            usage.is_partial
+            and self.observed_usage is not None
+            and (
+                self.snapshot_complete
+                or (
+                    self.snapshot_reported_fields is not None
+                    and self.snapshot_last_usage is not None
+                    and (usage.input_other, usage.input_cached, usage.output)
+                    == (
+                        self.snapshot_last_usage.input_other,
+                        self.snapshot_last_usage.input_cached,
+                        self.snapshot_last_usage.output,
+                    )
+                )
+            )
+        ):
+            usage = self.observed_usage
         self.observed_usage = None
         self.snapshot_complete = False
         self.snapshot_response_id = None
         self.snapshot_reported_fields = None
+        self.snapshot_last_usage = None
         if not _valid_token_usage(usage):
             self.unknown = True
         else:
@@ -126,6 +147,24 @@ class UsageAttemptLedger:
             error is not None and getattr(error, "_astrbot_usage_recorded", False)
         ):
             usage = None
+        elif (
+            usage.is_partial
+            and self.observed_usage is not None
+            and (
+                self.snapshot_complete
+                or (
+                    self.snapshot_reported_fields is not None
+                    and self.snapshot_last_usage is not None
+                    and (usage.input_other, usage.input_cached, usage.output)
+                    == (
+                        self.snapshot_last_usage.input_other,
+                        self.snapshot_last_usage.input_cached,
+                        self.snapshot_last_usage.output,
+                    )
+                )
+            )
+        ):
+            usage = self.observed_usage
         identity = getattr(error, "_astrbot_usage_attempt_id", None)
         already_observed = isinstance(identity, str) and identity in self.errors
         if usage is None and not already_observed:
@@ -211,6 +250,12 @@ def observe_usage_snapshot(
     )
     if same_response and ledger.snapshot_complete and not fully_reported:
         return
+    ledger.snapshot_last_usage = TokenUsage(
+        input_other=usage.input_other,
+        input_cached=usage.input_cached,
+        output=usage.output,
+        is_partial=usage.is_partial,
+    )
     previous = ledger.observed_usage
     if (
         not fully_reported
@@ -248,14 +293,27 @@ def observe_usage_snapshot(
     ledger.snapshot_response_id = identity
 
 
-def observe_attempt_usage(usage: TokenUsage | None, *, complete: bool = False) -> None:
+def observe_attempt_usage(
+    usage: TokenUsage | None,
+    *,
+    complete: bool = False,
+    response_id: str | None = None,
+    reported_fields: Collection[str] | None = None,
+) -> None:
     """Publish an internal OAuth snapshot through the stable request sink.
 
     Args:
         usage: Validated backend counters.
         complete: Whether the backend event terminated this attempt.
+        response_id: Actual response identity when the raw event includes it.
+        reported_fields: Input/output directions present in the raw event.
     """
-    observe_usage_snapshot(usage, complete=complete)
+    observe_usage_snapshot(
+        usage,
+        complete=complete,
+        response_id=response_id,
+        reported_fields=reported_fields,
+    )
 
 
 _current_usage_context: ContextVar[UsageContext] = ContextVar(

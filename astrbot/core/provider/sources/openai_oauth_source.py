@@ -643,9 +643,6 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
 
         if status_code in {401, 403}:
             auth_error = self._http_response_error(status_code, text)
-            observe_attempt_usage(
-                getattr(auth_error, "_astrbot_token_usage", None), complete=True
-            )
             refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
                 note_failed_attempt(auth_error)
@@ -710,10 +707,6 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                         auth_error = self._http_response_error(
                             response.status_code, text
                         )
-                        observe_attempt_usage(
-                            getattr(auth_error, "_astrbot_token_usage", None),
-                            complete=True,
-                        )
                         refreshed = await self._refresh_after_auth_failure(
                             attempted_version
                         )
@@ -741,10 +734,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                                     if isinstance(event_payload, dict)
                                     else event
                                 )
-                                observe_attempt_usage(
-                                    self._extract_response_usage(
-                                        event_payload.get("usage")
-                                    ),
+                                self._observe_backend_usage(
+                                    event_payload,
+                                    response_id=event.get("response_id"),
                                     complete=event.get("type")
                                     in {
                                         "response.completed",
@@ -813,10 +805,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                                     if isinstance(event_payload, dict)
                                     else event
                                 )
-                                observe_attempt_usage(
-                                    self._extract_response_usage(
-                                        event_payload.get("usage")
-                                    ),
+                                self._observe_backend_usage(
+                                    event_payload,
+                                    response_id=event.get("response_id"),
                                     complete=event.get("type")
                                     in {
                                         "response.completed",
@@ -852,9 +843,6 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
 
         if status_code in {401, 403}:
             auth_error = self._http_response_error(status_code, text)
-            observe_attempt_usage(
-                getattr(auth_error, "_astrbot_token_usage", None), complete=True
-            )
             refreshed = await self._refresh_after_auth_failure(attempted_version)
             if refreshed:
                 note_failed_attempt(auth_error)
@@ -1012,8 +1000,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                                             "error",
                                         },
                                     )
-                                observe_attempt_usage(
-                                    event_usage,
+                                self._observe_backend_usage(
+                                    event_payload,
+                                    response_id=event.get("response_id"),
                                     complete=event_type
                                     in {
                                         "response.completed",
@@ -1219,6 +1208,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         )
         payload = data.get("response")
         payload = payload if isinstance(payload, dict) else data
+        self._observe_backend_usage(
+            payload, complete=True, response_id=data.get("response_id")
+        )
         usage = self._extract_response_usage(payload.get("usage"))
         if usage is not None:
             setattr(error, "_astrbot_token_usage", usage)
@@ -1258,6 +1250,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         if isinstance(data, dict):
             payload = data.get("response")
             payload = payload if isinstance(payload, dict) else data
+            self._observe_backend_usage(
+                payload, complete=True, response_id=data.get("response_id")
+            )
             usage = self._extract_response_usage(payload.get("usage"))
             if usage is not None:
                 error._astrbot_token_usage = usage
@@ -1314,7 +1309,18 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                             "error",
                         },
                     )
-                    observe_attempt_usage(observed_usage, complete=True)
+                    self._observe_backend_usage(
+                        event_payload,
+                        complete=event_type
+                        in {
+                            "response.completed",
+                            "response.failed",
+                            "response.incomplete",
+                            "response.error",
+                            "error",
+                        },
+                        response_id=event.get("response_id"),
+                    )
                 if event_type in {
                     "error",
                     "response.error",
@@ -1568,6 +1574,32 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
             input_cached=cached_tokens,
             output=output_tokens,
             is_partial=not (known_input and known_output),
+        )
+
+    def _observe_backend_usage(
+        self, payload: Any, *, complete: bool, response_id: str | None = None
+    ) -> None:
+        """Forward only raw reported directions to the request-local usage sink.
+
+        Args:
+            payload: Backend response or event body with a raw usage object.
+            complete: Whether a terminal response supplied the counters.
+            response_id: Explicit enclosing event response identity, if present.
+        """
+        if not isinstance(payload, dict):
+            return
+        raw = payload.get("usage")
+        if not isinstance(raw, dict):
+            return
+        observe_attempt_usage(
+            self._extract_response_usage(raw),
+            complete=complete,
+            response_id=response_id or payload.get("response_id") or payload.get("id"),
+            reported_fields=frozenset(
+                direction
+                for direction in ("input", "output")
+                if raw.get(f"{direction}_tokens") is not None
+            ),
         )
 
     async def _record_provider_stat(
@@ -2318,12 +2350,7 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
             retry_rate_limits=retry_rate_limits,
             max_attempts=request_max_retries,
         )
-        observe_attempt_usage(
-            self._extract_response_usage(response.get("usage"))
-            if isinstance(response, dict)
-            else None,
-            complete=True,
-        )
+        self._observe_backend_usage(response, complete=True)
         try:
             return await self._parse_responses_completion(response, tools)
         except BaseException as exc:
@@ -2396,9 +2423,7 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     }
                 )
                 completed_response["output"] = existing_output
-        observe_attempt_usage(
-            self._extract_response_usage(completed_response.get("usage")), complete=True
-        )
+        self._observe_backend_usage(completed_response, complete=True)
         try:
             final_response = await self._parse_responses_completion(
                 completed_response, tools
