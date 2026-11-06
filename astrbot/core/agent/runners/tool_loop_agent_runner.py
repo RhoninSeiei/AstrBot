@@ -36,6 +36,11 @@ from astrbot.core.message.message_event_result import (
 from astrbot.core.persona_error_reply import (
     extract_persona_custom_error_message_from_event,
 )
+from astrbot.core.provider.context_budget import (
+    ContextBudgetExceeded,
+    estimate_context_tokens,
+    resolve_context_budget,
+)
 from astrbot.core.provider.entities import (
     LLMResponse,
     ProviderRequest,
@@ -56,7 +61,11 @@ from astrbot.core.provider.stats import ProviderStatSegment
 from astrbot.core.provider.usage_attribution import iter_with_usage
 from astrbot.core.utils.async_generator import iterate_in_task
 
-from ..context.compressor import ContextCompressor
+from ..context.compressor import (
+    ContextCompressor,
+    LLMSummaryCompressor,
+    TruncateByTurnsCompressor,
+)
 from ..context.config import ContextConfig
 from ..context.manager import ContextManager
 from ..context.token_counter import EstimateTokenCounter, TokenCounter
@@ -291,6 +300,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         provider_stats_managed_by_agent: bool = False,
         tool_result_overflow_dir: str | None = None,
         read_tool: FunctionTool | None = None,
+        fallback_max_context_tokens: int = 128000,
         **kwargs: T.Any,
     ) -> None:
         self.req = request
@@ -307,9 +317,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.tool_result_overflow_dir = tool_result_overflow_dir
         self.read_tool = read_tool
         self._tool_result_token_counter = EstimateTokenCounter()
-        self.request_context_manager_config = ContextConfig(
-            # <=0 disables token-based guarding.
-            max_context_tokens=provider.provider_config.get("max_context_tokens", 0),
+        self._context_policy = ContextConfig(
             # Enforce max turns before token-based guarding.
             enforce_max_turns=self.enforce_max_turns,
             truncate_turns=self.truncate_turns,
@@ -319,10 +327,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             custom_token_counter=self.custom_token_counter,
             custom_compressor=self.custom_compressor,
         )
-        self.request_context_manager = ContextManager(
-            self.request_context_manager_config
-        )
-
+        self.request_context_manager = None
+        self.fallback_max_context_tokens = fallback_max_context_tokens
+        self._primary_provider = provider
         self.provider = provider
         self.fallback_providers: list[Provider] = []
         seen_provider_ids: set[str] = {str(provider.provider_config.get("id", ""))}
@@ -361,10 +368,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.tool_schema_mode = tool_schema_mode
         self._tool_schema_param_set = None
         self._skill_like_raw_tool_set = None
-        if tool_schema_mode == "skills_like":
+        if tool_schema_mode == "skills_like" and self.req.func_tool:
             tool_set = self.req.func_tool
-            if not tool_set:
-                return
             self._skill_like_raw_tool_set = tool_set
             light_set = tool_set.get_light_tool_set()
             self._tool_schema_param_set = tool_set.get_param_only_tool_set()
@@ -393,6 +398,72 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self.provider_stat_segments: list[ProviderStatSegment] = []
         self._provider_token_usage: dict[int, TokenUsage] = {}
         self._provider_usage_start_times: dict[int, float] = {}
+        await self._prepare_context_for_provider(
+            messages,
+            model=self.req.model,
+            func_tool=self._func_tool_for_provider(),
+            process=False,
+        )
+
+    async def _prepare_context_for_provider(
+        self,
+        messages: list[Message],
+        *,
+        model: str | None,
+        func_tool: ToolSet | None,
+        process: bool = True,
+    ) -> list[Message] | None:
+        """Resolve the actual candidate budget for a primary or auxiliary call.
+
+        Args:
+            messages: Complete current input, including fresh tool results.
+            model: Override only when calling the original request provider.
+            func_tool: Actual tool schemas sent by this call.
+            process: Configure only at reset, before any request-time hooks.
+
+        Returns:
+            Processed messages, or None when processing is aborted.
+
+        Raises:
+            ContextBudgetExceeded: If protected OAuth input cannot fit.
+        """
+        self.context_budget = await resolve_context_budget(
+            self.provider,
+            model=model,
+            fallback_max_context_tokens=self.fallback_max_context_tokens,
+        )
+        schema_reserve = (
+            estimate_context_tokens({"tools": func_tool.openai_schema()})
+            if func_tool and func_tool.tools
+            else 0
+        )
+        config = replace(
+            self._context_policy,
+            max_context_tokens=self.context_budget.input_budget,
+            compression_threshold=self.context_budget.compression_threshold,
+            reserved_context_tokens=schema_reserve,
+            reject_oversized_input=self.context_budget.enforce_input_limit,
+            conservative_token_count=self.context_budget.enforce_input_limit,
+        )
+        previous = self.request_context_manager
+        if (
+            previous is None
+            or previous.config.conservative_token_count
+            != config.conservative_token_count
+        ):
+            self.request_context_manager = ContextManager(config)
+        else:
+            previous.config = config
+            if self._context_policy.custom_compressor is None and isinstance(
+                previous.compressor, (TruncateByTurnsCompressor, LLMSummaryCompressor)
+            ):
+                previous.compressor.compression_threshold = config.compression_threshold
+        self.request_context_manager_config = config
+        if not process:
+            return messages
+        # Prior response usage describes a different payload. Recount the actual
+        # messages and schemas after hooks, tool outputs, or a provider switch.
+        return await self._await_or_stop(self.request_context_manager.process(messages))
 
     def _read_tool_hint(self) -> str:
         if self.read_tool is not None:
@@ -641,12 +712,41 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             await asyncio.gather(abort_task, return_exceptions=True)
 
     async def _iter_llm_responses(
-        self, *, include_model: bool = True
+        self,
+        *,
+        include_model: bool = True,
+        context_messages: list[Message] | None = None,
     ) -> T.AsyncGenerator[LLMResponse, None]:
         """Yields chunks *and* a final LLMResponse."""
+        model = (
+            self.req.model
+            if include_model and self.provider is self._primary_provider
+            else None
+        )
+        func_tool = self._func_tool_for_provider()
+        candidate_messages = (
+            context_messages
+            if context_messages is not None
+            else copy.deepcopy(self.run_context.messages)
+        )
+        messages = await self._await_or_stop(
+            self._prepare_context_for_provider(
+                candidate_messages, model=model, func_tool=func_tool
+            )
+        )
+        if messages is None:
+            return
+        if not messages:
+            yield LLMResponse(
+                role="err", completion_text="No messages remain for the LLM request."
+            )
+            return
+        # Retried attempts may reuse this candidate's prepared copy. Other
+        # candidates still start from the last successfully committed history.
+        candidate_messages[:] = messages
         payload = {
-            "contexts": self._sanitize_contexts_for_provider(self.run_context.messages),
-            "func_tool": self._func_tool_for_provider(),
+            "contexts": self._sanitize_contexts_for_provider(candidate_messages),
+            "func_tool": func_tool,
             "session_id": self.req.session_id,
             "conversation_id": (
                 self.req.conversation.cid if self.req.conversation else None
@@ -657,7 +757,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         }
         if include_model:
             # For primary provider we keep explicit model selection if provided.
-            payload["model"] = self.req.model
+            payload["model"] = model
         if self.streaming:
             stream = self.provider.text_chat_stream(**payload)
             try:
@@ -693,7 +793,14 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             return
 
-        candidates = [self.provider, *self.fallback_providers]
+        candidates = [
+            self.provider,
+            *[
+                provider
+                for provider in self.fallback_providers
+                if provider is not self.provider
+            ],
+        ]
         total_candidates = len(candidates)
         last_exception: Exception | None = None
         last_err_response: LLMResponse | None = None
@@ -710,6 +817,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     candidate_id,
                 )
             self.provider = candidate
+            candidate_messages = copy.deepcopy(self.run_context.messages)
             candidate_start_time = self._mark_provider_attempt_started(
                 candidate,
                 time.time(),
@@ -739,7 +847,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     with attempt:
                         try:
                             async with aclosing(
-                                self._iter_llm_responses(include_model=idx == 0)
+                                self._iter_llm_responses(
+                                    include_model=candidate is self._primary_provider,
+                                    context_messages=candidate_messages,
+                                )
                             ) as responses:
                                 async for resp in responses:
                                     if resp.is_chunk:
@@ -778,6 +889,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                         break
 
                                     self._sanitize_malformed_tool_calls(resp)
+                                    if resp.role != "err":
+                                        self.run_context.messages = candidate_messages
                                     yield resp
                                     return
 
@@ -816,7 +929,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     "Chat Model %s request error: %s",
                     candidate_id,
                     exc,
-                    exc_info=True,
+                    exc_info=not isinstance(exc, ContextBudgetExceeded),
                 )
                 if candidate_has_stream_output:
                     break
@@ -1027,21 +1140,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         # 开始处理，转换到运行状态
         self._transition_state(AgentState.RUNNING)
         llm_resp_result = None
-
-        # Process request-time context before sending it to the provider.
-        token_usage = self.req.conversation.token_usage if self.req.conversation else 0
-        self._simple_print_message_role("[BefCompact]", self.run_context.messages)
-        processed_messages = await self._await_or_stop(
-            self.request_context_manager.process(
-                self.run_context.messages,
-                trusted_token_usage=token_usage,
-            )
-        )
-        if processed_messages is None:
-            yield await self._finalize_aborted_step()
-            return
-        self.run_context.messages = processed_messages
-        self._simple_print_message_role("[AftCompact]", self.run_context.messages)
 
         async with aclosing(self._iter_llm_responses_with_fallback()) as responses:
             async for llm_response in responses:
@@ -1724,11 +1822,25 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             if param_subset.tools and tool_names:
                 contexts = self._build_tool_requery_context(tool_names)
+                effective_model = (
+                    self.req.model if self.provider is self._primary_provider else None
+                )
+                prepared_contexts = await self._await_or_stop(
+                    self._prepare_context_for_provider(
+                        [Message.model_validate(message) for message in contexts],
+                        model=effective_model,
+                        func_tool=param_subset,
+                    )
+                )
+                if prepared_contexts is None:
+                    return llm_resp, full_tool_set
                 requery_resp = await self._await_additional_provider_response(
                     self.provider.text_chat(
-                        contexts=self._sanitize_contexts_for_provider(contexts),
+                        contexts=self._sanitize_contexts_for_provider(
+                            prepared_contexts
+                        ),
                         func_tool=param_subset,
-                        model=self.req.model,
+                        model=effective_model,
                         session_id=self.req.session_id,
                         extra_user_content_parts=self.req.extra_user_content_parts,
                         # tool_choice="required",
@@ -1754,13 +1866,25 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         tool_names,
                         extra_instruction=self.SKILLS_LIKE_REQUERY_REPAIR_INSTRUCTION,
                     )
+                    prepared_repair_contexts = await self._await_or_stop(
+                        self._prepare_context_for_provider(
+                            [
+                                Message.model_validate(message)
+                                for message in repair_contexts
+                            ],
+                            model=effective_model,
+                            func_tool=param_subset,
+                        )
+                    )
+                    if prepared_repair_contexts is None:
+                        return llm_resp, full_tool_set
                     repair_resp = await self._await_additional_provider_response(
                         self.provider.text_chat(
                             contexts=self._sanitize_contexts_for_provider(
-                                repair_contexts
+                                prepared_repair_contexts
                             ),
                             func_tool=param_subset,
-                            model=self.req.model,
+                            model=effective_model,
                             session_id=self.req.session_id,
                             extra_user_content_parts=self.req.extra_user_content_parts,
                             # tool_choice="required",

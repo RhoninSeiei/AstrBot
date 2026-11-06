@@ -2059,7 +2059,8 @@ class TestBuildMainAgent:
         assert kwargs["llm_compress_keep_recent_ratio"] == 0.3
         assert kwargs["enforce_max_turns"] == 12
         assert kwargs["truncate_turns"] == 3
-        assert kwargs["provider"].provider_config["max_context_tokens"] == 16384
+        assert kwargs["fallback_max_context_tokens"] == 16384
+        assert "max_context_tokens" not in kwargs["provider"].provider_config
 
     @pytest.mark.asyncio
     async def test_build_main_agent_no_provider(self, mock_event, mock_context):

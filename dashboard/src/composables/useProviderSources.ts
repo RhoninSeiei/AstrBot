@@ -3,6 +3,7 @@ import { providerApi } from '@/api/v1'
 import { getProviderIcon, isMonochromeProviderIcon } from '@/utils/providerUtils'
 import { askForConfirmation as askForConfirmationDialog, useConfirmDialog } from '@/utils/confirmDialog'
 import { normalizeTextInput } from '@/utils/inputValue'
+import { defaultContextWindow } from '@/utils/providerContextDefaults.mjs'
 import { sponsorCatalog, loadSponsorCatalog } from '@/utils/sponsorCatalog'
 import { useI18n } from '@/i18n/composables'
 
@@ -674,10 +675,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       }
     }
 
-    let max_context_tokens = 0
-    if (metadata?.limit?.context && typeof metadata.limit.context === 'number') {
-      max_context_tokens = metadata.limit.context
-    }
+    const max_context_tokens = defaultContextWindow(selectedProviderSource.value, metadata)
 
     return {
       id: newId,

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,11 @@ from astrbot.core.provider.oauth.openai_oauth_audio_input import (
     BoundedOAuthAudioResolver,
 )
 from astrbot.core.provider.sources.request_retry import ProviderRequestError
+from astrbot.core.provider.usage_recorder import (
+    UsageAttemptLedger,
+    current_attempt_ledger,
+    note_failed_attempt,
+)
 
 OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -79,21 +85,58 @@ class OpenAIOAuthTranscriptionClient:
             raise ValueError("OAuth 转录模型不能为空。")
         if self._closed:
             raise RuntimeError("OAuth transcription client is closed")
-        task = asyncio.create_task(
-            self._transcribe_audio(audio_url, str(model).strip(), language, prompt)
-        )
+        observation = {"usage": None, "model": str(model).strip()}
+        ledger = UsageAttemptLedger()
+        ledger_token = current_attempt_ledger.set(ledger)
+        try:
+            task = asyncio.create_task(
+                self._transcribe_audio(
+                    audio_url, str(model).strip(), language, prompt, observation
+                )
+            )
+        finally:
+            current_attempt_ledger.reset(ledger_token)
         self._pending.add(task)
+        start_time = time.time()
+        status = "completed"
+        final_error = None
         try:
             return await asyncio.wait_for(
                 task,
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError as exc:
-            raise TimeoutError(
+            status = "error"
+            final_error = TimeoutError(
                 f"OpenAI OAuth 音频转录超时：超过 {self.timeout:g} 秒。"
-            ) from exc
+            )
+            if observation["usage"] is not None:
+                final_error._astrbot_token_usage = observation["usage"]
+            raise final_error from exc
+        except BaseException as exc:
+            final_error = exc
+            status = "aborted" if isinstance(exc, asyncio.CancelledError) else "error"
+            if observation["usage"] is not None:
+                exc._astrbot_token_usage = observation["usage"]
+            raise
         finally:
             self._pending.discard(task)
+            record = getattr(self.oauth_provider, "_record_provider_stat", None)
+            if record is not None:
+                ledger_token = current_attempt_ledger.set(None)
+                try:
+                    await record(
+                        request_kind="transcription",
+                        status=status,
+                        usage=ledger.combined(observation["usage"], final_error),
+                        start_time=start_time,
+                        end_time=time.time(),
+                        model=observation["model"],
+                    )
+                    if final_error is not None:
+                        final_error._astrbot_usage_recorded = True
+                finally:
+                    current_attempt_ledger.reset(ledger_token)
 
     async def close(self) -> None:
         """Reject new work and cancel all requests owned by this client."""
@@ -110,6 +153,7 @@ class OpenAIOAuthTranscriptionClient:
         model: str,
         language: str | None,
         prompt: str | None,
+        observation: dict[str, Any] | None = None,
     ) -> str:
         await self.oauth_provider._ensure_fresh_oauth_token()
         async with BoundedOAuthAudioResolver(
@@ -138,17 +182,47 @@ class OpenAIOAuthTranscriptionClient:
                 audio_bytes,
                 form,
             )
+            if observation is not None:
+                extractor = getattr(
+                    self.oauth_provider, "_extract_response_usage", None
+                )
+                observation["usage"] = (
+                    extractor(payload.get("usage"))
+                    if extractor is not None and isinstance(payload, dict)
+                    else None
+                )
+                if isinstance(payload, dict) and isinstance(payload.get("model"), str):
+                    observation["model"] = payload["model"]
             if status_code == 401:
                 refreshed = await self.oauth_provider._refresh_after_auth_failure(
                     attempted_version
                 )
                 if refreshed:
+                    error = RuntimeError("OAuth transcription authentication retry")
+                    if observation is not None and observation["usage"] is not None:
+                        error._astrbot_token_usage = observation["usage"]
+                    note_failed_attempt(error)
+                    ledger = current_attempt_ledger.get()
+                    if ledger is not None:
+                        ledger.begin_attempt()
+                    if observation is not None:
+                        observation["usage"] = None
                     status_code, payload, _ = await self._post_transcription(
                         filename,
                         mime_type,
                         audio_bytes,
                         form,
                     )
+                    if observation is not None:
+                        observation["usage"] = (
+                            extractor(payload.get("usage"))
+                            if extractor is not None and isinstance(payload, dict)
+                            else None
+                        )
+                        if isinstance(payload, dict) and isinstance(
+                            payload.get("model"), str
+                        ):
+                            observation["model"] = payload["model"]
 
         if status_code == 401:
             raise RuntimeError("OpenAI OAuth 音频转录认证失败，请重新绑定账户。")

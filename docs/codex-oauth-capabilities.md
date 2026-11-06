@@ -76,6 +76,44 @@ These controls stay attached to every model call in the agent run, including
 function-result rounds, schema repair calls and fallback providers. A 429 error
 retains `status_code=429` on the final `LLMResponse` when fallback is disabled.
 
+## Context budgets
+
+`max_context_tokens=0` selects an automatic request-local budget. For Codex OAuth,
+the target window is 490,000 tokens, capped by the authenticated catalog's default
+`context_window`. The optional `max_context_window` is not used to enlarge an
+automatic budget. An explicit positive value takes precedence, subject to the
+known model maximum. Catalog failures use conservative Codex fallback windows;
+public API model metadata does not override the OAuth account's window.
+
+The window, input allowance, and compression trigger are separate. The default
+output reservation is `min(32768, window // 10)` and the estimation margin is
+`min(8192, window // 100)`. Compression starts at the smaller of 90% of the window
+and the input allowance. For a 490,000-token window, these are 452,332 input tokens
+and a 441,000-token compression trigger. A 272,000-token window has a 242,080-token
+input allowance and trigger. Larger configured output limits can increase the
+local reservation; this does not impose a new output cap on the Codex backend.
+
+Main chat and plugin-created tool loops use the same resolver on each actual
+provider/model candidate. Existing turn limits and summary providers remain in
+effect. The final OAuth request also checks complete instructions, messages,
+function schemas and media, including for direct `text_chat` and streaming calls.
+That final check does not call a summary model: it only removes old complete
+turns if needed. System instructions, the latest request and unfinished or
+cross-boundary tool pairs are protected. If they cannot fit, the request fails
+locally with a safe budget error. Callers' histories and shared provider settings
+are not rewritten.
+
+Text allowance uses a locally available, hash-verified `o200k_base` vocabulary
+where available, with a conservative fallback when it is absent. The vocabulary
+is an approximation for these models, not an exact backend token meter. Media
+allowances are estimates, and budget estimates never replace reported usage.
+There is no request-time vocabulary download. Other provider families retain
+their existing 82% soft compression policy.
+
+The offline encoder uses the `o200k_base` pattern and vocabulary format from
+OpenAI's tiktoken project. Its [MIT license](third-party/tiktoken-license.txt)
+is retained with this source.
+
 ## Read-only quota query
 
 Quota configuration is intentionally hidden from general AI settings and other
@@ -260,3 +298,48 @@ Protocol references:
 End-to-end voice acceptance requires a real plugin WebRTC peer and audio input
 and output. Unit tests, SDP negotiation and sideband readiness each establish
 only their corresponding layer.
+
+## Usage reporting
+
+The usage ledger records backend-reported tokens, independently of context
+estimates. A missing direction remains partial; no usage remains missing.
+Explicit zero values are retained. Failed attempts with reported usage contribute
+to the logical call's ledger, while `LLMResponse.usage` remains the usage of its
+single response. Separately recorded image and transcription calls are not added
+again to the enclosing chat call.
+
+Streaming providers can publish a request-local snapshot before yielding the
+response that contains it:
+
+```python
+from astrbot.core.provider.usage_recorder import observe_usage_snapshot
+
+observe_usage_snapshot(
+    usage,
+    response_id=response_id,
+    complete=True,  # Only after observing a terminal backend response.
+    reported_fields={"input", "output"},
+)
+```
+
+Publish cumulative snapshots for the current response, not token deltas.
+`reported_fields` identifies directions actually present in a partial response,
+including explicit zeros. Repeated snapshots replace known fields instead of
+adding them. A full snapshot may correct a previous value downward. Directional
+partial snapshots remain partial until an explicitly complete usage report is
+received. The hook is a no-op outside a managed request; providers supporting
+older AstrBot versions should import it optionally. A consumed final response
+takes precedence, preventing duplicate accounting. Early stream closure can
+retain a snapshot that the producer already observed.
+
+Realtime response snapshots are keyed by session and response identity and
+persisted asynchronously. Writes and close-time draining are bounded so a slow
+database cannot block audio handling. Queue exhaustion or storage timeouts are
+logged; this is not a durable outbox. Session totals without a per-response
+identity are not interpreted as additional response usage.
+
+Coverage describes the fraction of recorded calls that include usage. Calls
+made through an uninstrumented private SDK are outside that denominator.
+Historical missing reports cannot be reconstructed. Audio duration, local token
+estimates and OAuth subscription allowance changes are not substituted for
+backend-reported token usage.

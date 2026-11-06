@@ -2,6 +2,8 @@ import json
 import re
 from typing import Protocol, runtime_checkable
 
+from astrbot.core.provider.context_budget import estimate_context_tokens
+
 from ..message import AudioURLPart, ImageURLPart, Message, TextPart, ThinkPart
 
 
@@ -53,9 +55,22 @@ class EstimateTokenCounter:
     are all counted so that the context compressor can trigger in time.
     """
 
+    def __init__(self, *, conservative: bool = False) -> None:
+        """Choose the legacy estimate or the shared OAuth input estimator.
+
+        Args:
+            conservative: Use the provider's offline request estimator when true.
+        """
+        self.conservative = conservative
+
     def count_tokens(
         self, messages: list[Message], trusted_token_usage: int = 0
     ) -> int:
+        if self.conservative:
+            estimate = estimate_context_tokens(
+                {"input": [message.model_dump() for message in messages]}
+            )
+            return max(estimate, trusted_token_usage)
         if trusted_token_usage > 0:
             return trusted_token_usage
 

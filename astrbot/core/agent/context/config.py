@@ -33,3 +33,11 @@ class ContextConfig:
     """Custom token counting method. If None, the default method is used."""
     custom_compressor: ContextCompressor | None = None
     """Custom context compression method. If None, the default method is used."""
+    compression_threshold: float = 0.82
+    """Proactive trigger relative to the input allowance, after output reservation."""
+    reserved_context_tokens: int = 0
+    """Tokens used by request fields outside the message list, such as tool schemas."""
+    reject_oversized_input: bool = False
+    """Reject protected input that cannot fit. Enabled for OAuth runner requests."""
+    conservative_token_count: bool = False
+    """Use the shared OAuth request estimator instead of the legacy text estimate."""

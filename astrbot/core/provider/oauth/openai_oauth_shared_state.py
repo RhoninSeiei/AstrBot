@@ -27,6 +27,7 @@ class OpenAIOAuthSharedState:
         self.refresh_lock = asyncio.Lock()
         self.models_lock = asyncio.Lock()
         self.models_cache: list[str] = []
+        self.models_metadata: dict[str, dict[str, int]] = {}
         self.models_expires_at = 0.0
         self.models_cache_key: tuple[str, str] | None = None
         self.version = 0
@@ -37,6 +38,11 @@ class OpenAIOAuthSharedState:
         self.replace(source_config)
 
     def apply(self, patch: dict[str, Any]) -> int:
+        if (
+            "oauth_account_id" in patch
+            and self._credentials.get("oauth_account_id") != patch["oauth_account_id"]
+        ):
+            self.clear_models_cache()
         version_changed = False
         for key in OPENAI_OAUTH_CREDENTIAL_FIELDS:
             if key not in patch:
@@ -53,6 +59,11 @@ class OpenAIOAuthSharedState:
         next_credentials = {
             key: source_config.get(key, "") for key in OPENAI_OAUTH_CREDENTIAL_FIELDS
         }
+        if (
+            self._credentials.get("oauth_account_id")
+            != next_credentials["oauth_account_id"]
+        ):
+            self.clear_models_cache()
         if any(
             self._credentials.get(key) != next_credentials[key]
             for key in _VERSION_FIELDS
@@ -60,6 +71,13 @@ class OpenAIOAuthSharedState:
             self.version += 1
         self._credentials = next_credentials
         return self.version
+
+    def clear_models_cache(self) -> None:
+        """Discard account/backend-specific model names and numeric metadata."""
+        self.models_cache = []
+        self.models_metadata = {}
+        self.models_expires_at = 0.0
+        self.models_cache_key = None
 
     def snapshot(self) -> dict[str, Any]:
         return dict(self._credentials)

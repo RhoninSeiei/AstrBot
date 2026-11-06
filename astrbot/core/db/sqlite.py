@@ -372,11 +372,72 @@ class SQLiteDatabase(BaseDatabase):
             session: AsyncSession
             async with session.begin():
                 if request_id is not None:
-                    await session.execute(
-                        sqlite_insert(ProviderStat)
-                        .values(**record.model_dump(exclude={"id"}))
-                        .on_conflict_do_nothing(index_elements=["request_id"])
+                    statement = sqlite_insert(ProviderStat).values(
+                        **record.model_dump(exclude={"id"})
                     )
+                    snapshot = (
+                        stats.get("usage_snapshot") is True
+                        and isinstance(request_id, str)
+                        and request_id.startswith("oauth-realtime-snapshot:")
+                        and record.request_kind == "realtime"
+                        and record.stat_version == 1
+                    )
+                    if snapshot:
+                        # Terminal updates replace one response snapshot, including
+                        # downward corrections; ordinary records remain immutable.
+                        quality = {"missing": 0, "partial": 1, "reported": 2}
+                        incoming_quality = quality.get(record.usage_status, 0)
+                        update_fields = {
+                            key: getattr(record, key)
+                            for key in (
+                                "status",
+                                "provider_model",
+                                "token_input_other",
+                                "token_input_cached",
+                                "token_output",
+                                "usage_status",
+                                "end_time",
+                            )
+                        }
+                        present = stats.get("usage_snapshot_fields")
+                        present = (
+                            {
+                                value
+                                for value in present
+                                if isinstance(value, str)
+                                and value in {"input", "output", "model"}
+                            }
+                            if isinstance(present, (list, tuple, set, frozenset))
+                            else set()
+                        )
+                        if "model" not in present:
+                            update_fields.pop("provider_model")
+                        if record.usage_status != "reported":
+                            if "input" not in present:
+                                update_fields.pop("token_input_other")
+                                update_fields.pop("token_input_cached")
+                            if "output" not in present:
+                                update_fields.pop("token_output")
+                        statement = statement.on_conflict_do_update(
+                            index_elements=["request_id"],
+                            set_=update_fields,
+                            where=(ProviderStat.provider_id == provider_id)
+                            & (ProviderStat.request_kind == "realtime")
+                            & (ProviderStat.stat_version == 1)
+                            & (
+                                case(
+                                    (ProviderStat.usage_status == "reported", 2),
+                                    (ProviderStat.usage_status == "partial", 1),
+                                    else_=0,
+                                )
+                                <= incoming_quality
+                            ),
+                        )
+                    else:
+                        statement = statement.on_conflict_do_nothing(
+                            index_elements=["request_id"]
+                        )
+                    await session.execute(statement)
                     result = await session.execute(
                         select(ProviderStat).where(
                             ProviderStat.request_id == request_id

@@ -98,3 +98,129 @@ async def test_fresh_database_accepts_old_insert_columns(temp_db):
         row = (await session.execute(select(ProviderStat))).scalar_one()
         assert row.stat_version == 0
         assert row.token_input_other == 3
+
+
+@pytest.mark.asyncio
+async def test_realtime_snapshot_updates_replace_totals_and_preserve_attribution(
+    temp_db,
+):
+    await temp_db.initialize()
+    kwargs = {
+        "umo": "voice:original",
+        "provider_id": "oauth/model",
+        "provider_model": "live",
+        "stats": {
+            "request_id": "oauth-realtime-snapshot:session:response",
+            "request_kind": "realtime",
+            "stat_version": 1,
+            "usage_snapshot": True,
+            "usage_status": "partial",
+            "plugin_id": "original-plugin",
+            "start_time": 1,
+            "end_time": 2,
+            "token_usage": {"input_other": 4, "input_cached": 0, "output": 0},
+        },
+    }
+    first = await temp_db.insert_provider_stat(**kwargs)
+    for amount in (7, 2):
+        kwargs["umo"] = "voice:replacement"
+        kwargs["stats"].update(
+            {
+                "plugin_id": "replacement-plugin",
+                "usage_status": "reported",
+                "start_time": 9,
+                "end_time": 10,
+                "token_usage": {"input_other": amount, "input_cached": 0, "output": 1},
+            }
+        )
+        updated = await temp_db.insert_provider_stat(**kwargs)
+        assert updated.id == first.id
+        assert updated.token_input_other == amount
+        assert updated.usage_status == "reported"
+        assert updated.umo == "voice:original"
+        assert updated.plugin_id == "original-plugin"
+        assert updated.start_time == 1
+    # Lower-quality snapshots cannot erase a completed reported response.
+    kwargs["stats"].update(
+        {"usage_status": "partial", "token_usage": {"input_other": 99}}
+    )
+    unchanged = await temp_db.insert_provider_stat(**kwargs)
+    assert unchanged.token_input_other == 2
+    async with temp_db.get_db() as session:
+        rows = (await session.execute(select(ProviderStat))).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["provider", "kind", "id", "version", "flag"])
+async def test_snapshot_mode_cannot_modify_unrelated_or_ordinary_record(
+    temp_db, change
+):
+    await temp_db.initialize()
+    kwargs = {
+        "umo": "original",
+        "provider_id": "oauth/model",
+        "stats": {
+            "request_id": "oauth-realtime-snapshot:session:response",
+            "request_kind": "realtime",
+            "stat_version": 1,
+            "usage_snapshot": True,
+            "usage_status": "reported",
+            "token_usage": {"input_other": 4, "output": 1},
+        },
+    }
+    if change == "id":
+        kwargs["stats"]["request_id"] = "ordinary-request"
+    first = await temp_db.insert_provider_stat(**kwargs)
+    kwargs["stats"]["token_usage"] = {"input_other": 100, "output": 20}
+    if change == "provider":
+        kwargs["provider_id"] = "other/model"
+    elif change == "kind":
+        kwargs["stats"]["request_kind"] = "text"
+    elif change == "version":
+        kwargs["stats"]["stat_version"] = 0
+    elif change == "flag":
+        kwargs["stats"]["usage_snapshot"] = False
+    repeated = await temp_db.insert_provider_stat(**kwargs)
+    assert repeated.id == first.id
+    assert repeated.token_input_other == 4
+
+
+@pytest.mark.asyncio
+async def test_disjoint_partial_snapshot_fields_preserve_known_directions_and_explicit_zero(
+    temp_db,
+):
+    await temp_db.initialize()
+    kwargs = {
+        "umo": "voice",
+        "provider_id": "oauth/model",
+        "stats": {
+            "request_id": "oauth-realtime-snapshot:session:partial",
+            "request_kind": "realtime",
+            "stat_version": 1,
+            "usage_snapshot": True,
+            "usage_status": "partial",
+            "usage_snapshot_fields": ["input"],
+            "token_usage": {"input_other": 4, "output": 0},
+        },
+    }
+    first = await temp_db.insert_provider_stat(**kwargs)
+    kwargs["stats"].update(
+        {
+            "usage_snapshot_fields": ["output"],
+            "token_usage": {"input_other": 0, "output": 2},
+        }
+    )
+    second = await temp_db.insert_provider_stat(**kwargs)
+    assert second.id == first.id
+    assert second.token_input_other == 4 and second.token_output == 2
+    assert second.usage_status == "partial"
+    kwargs["stats"].update(
+        {
+            "usage_snapshot_fields": ["input"],
+            "token_usage": {"input_other": 0, "output": 0},
+        }
+    )
+    third = await temp_db.insert_provider_stat(**kwargs)
+    assert third.token_input_other == 0 and third.token_output == 2
+    assert third.usage_status == "partial"

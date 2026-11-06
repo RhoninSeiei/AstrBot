@@ -145,7 +145,18 @@ async def retry_provider_request(
 
     async for attempt in retrying:
         with attempt:
-            return await request_factory()
+            try:
+                from astrbot.core.provider.usage_recorder import current_attempt_ledger
+
+                ledger = current_attempt_ledger.get()
+                if ledger is not None:
+                    ledger.begin_attempt()
+                return await request_factory()
+            except BaseException as error:
+                from astrbot.core.provider.usage_recorder import note_failed_attempt
+
+                note_failed_attempt(error, new_attempt=True)
+                raise
 
     raise RuntimeError("Provider request retry loop exited unexpectedly.")
 

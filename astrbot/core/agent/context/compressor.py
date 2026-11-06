@@ -1,3 +1,4 @@
+import asyncio
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ...provider.modalities import (
@@ -144,6 +145,7 @@ class LLMSummaryCompressor:
         self.keep_recent_ratio = min(max(float(keep_recent_ratio), 0.0), 0.3)
         self.compression_threshold = compression_threshold
         self.token_counter = token_counter or EstimateTokenCounter()
+        self.preserve_message_ids: set[int] | None = None
 
         self.instruction_text = instruction_text or (
             "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -212,7 +214,20 @@ class LLMSummaryCompressor:
         """
         from .round_utils import split_into_rounds
 
-        rounds = split_into_rounds(messages)
+        strict = self.preserve_message_ids is not None
+        instruction_messages = [
+            message for message in messages if message.role in {"system", "developer"}
+        ]
+        working_messages = (
+            [
+                message
+                for message in messages
+                if message.role not in {"system", "developer"}
+            ]
+            if strict
+            else messages
+        )
+        rounds = split_into_rounds(working_messages)
         message_rounds = [
             [seg for seg in rnd if isinstance(seg, Message)] for rnd in rounds
         ]
@@ -221,6 +236,26 @@ class LLMSummaryCompressor:
             message_rounds,
             total_tokens,
         )
+
+        if strict:
+            preserved_round_ids = {
+                id(current)
+                for current in message_rounds
+                if any(id(message) in self.preserve_message_ids for message in current)
+            }
+            recent_round_ids = {
+                id(current) for current in recent_rounds
+            } | preserved_round_ids
+            old_rounds = [
+                current
+                for current in old_rounds
+                if id(current) not in preserved_round_ids
+            ]
+            recent_rounds = [
+                current for current in message_rounds if id(current) in recent_round_ids
+            ]
+            if not old_rounds:
+                return messages
 
         # The latest user message is the active request. Keep its whole round
         # exact even when the ratio is 0 or the ratio budget would otherwise
@@ -238,6 +273,8 @@ class LLMSummaryCompressor:
             recent_rounds = []
 
         summary_contexts = [msg for rnd in old_rounds for msg in rnd]
+        if strict:
+            summary_contexts = instruction_messages + summary_contexts
         if not any(msg.role != "system" for msg in summary_contexts):
             if recent_rounds and messages and messages[-1].role == "user":
                 return messages
@@ -278,9 +315,13 @@ class LLMSummaryCompressor:
             from astrbot.core.provider.usage_recorder import usage_scope
 
             with usage_scope(request_kind="compression"):
-                response = await self.provider.text_chat(
-                    contexts=sanitized_summary_contexts,
-                    request_max_retries=1,
+                # Keep the selected request's estimator and other ContextVars
+                # isolated from the summary provider's own request policy.
+                response = await asyncio.create_task(
+                    self.provider.text_chat(
+                        contexts=sanitized_summary_contexts,
+                        request_max_retries=1,
+                    )
                 )
             summary_content = (response.completion_text or "").strip()
         except Exception as e:
@@ -292,7 +333,7 @@ class LLMSummaryCompressor:
             return messages
 
         # Build result: system messages + summary pair + recent rounds
-        result = _extract_system_messages(messages)
+        result = instruction_messages if strict else _extract_system_messages(messages)
 
         result.append(
             Message(

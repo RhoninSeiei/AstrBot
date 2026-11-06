@@ -120,7 +120,6 @@ from astrbot.core.utils.astrbot_path import (
 )
 from astrbot.core.utils.file_extract import extract_file_moonshotai
 from astrbot.core.utils.image_input import prepare_request_images
-from astrbot.core.utils.llm_metadata import LLM_METADATAS
 from astrbot.core.utils.media_utils import (
     describe_media_ref,
     is_file_uri,
@@ -1945,18 +1944,6 @@ async def build_main_agent(
             req.model = None
         fallback_providers = [p for p in fallback_providers if p is not provider]
 
-    if provider.provider_config.get("max_context_tokens", 0) <= 0:
-        model = provider.get_model()
-        if model_info := LLM_METADATAS.get(model):
-            provider.provider_config["max_context_tokens"] = model_info["limit"][
-                "context"
-            ]
-        else:
-            # fallback: default to configured fallback value
-            provider.provider_config["max_context_tokens"] = (
-                config.fallback_max_context_tokens
-            )
-
     if event.get_platform_name() == "webchat":
         asyncio.create_task(_handle_webchat(event, req, provider))
 
@@ -2020,6 +2007,7 @@ async def build_main_agent(
         enforce_max_turns=config.max_context_length,
         tool_schema_mode=config.tool_schema_mode,
         fallback_providers=fallback_providers,
+        fallback_max_context_tokens=config.fallback_max_context_tokens,
         request_max_retries=config.request_max_retries,
         provider_stats_managed_by_agent=True,
         tool_result_overflow_dir=(

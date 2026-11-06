@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -17,6 +17,21 @@ from astrbot.core.provider.entities import TokenUsage
 from astrbot.core.provider.provider import provider_stats_managed_by_agent
 
 
+def _valid_token_usage(usage: Any) -> bool:
+    """Validate optional side-channel counters before statistics arithmetic.
+
+    Args:
+        usage: Untrusted response or exception metadata.
+
+    Returns:
+        Whether this is a finite nonnegative TokenUsage supported by the ledger.
+    """
+    return isinstance(usage, TokenUsage) and all(
+        type(value) is int and 0 <= value <= 2**63 - 1
+        for value in (usage.input_other, usage.input_cached, usage.output)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class UsageContext:
     session_umo: str | None = None
@@ -25,6 +40,222 @@ class UsageContext:
     origin_type: str | None = None
     conversation_id: str | None = None
     request_kind: str | None = None
+
+
+class UsageAttemptLedger:
+    """Keep failed-attempt usage separate from the final prompt's token usage."""
+
+    def __init__(self, provider_key: int | None = None) -> None:
+        """Initialize an independent logical call ledger.
+
+        Args:
+            provider_key: Owning provider identity for nested-call isolation.
+        """
+        self.provider_key = provider_key
+        self.usage: TokenUsage | None = None
+        self.unknown = False
+        self.errors: set[str] = set()
+        self.observed_usage: TokenUsage | None = None
+        self.snapshot_complete = False
+        self.snapshot_terminal_received = False
+        self.snapshot_response_id: str | None = None
+        self.snapshot_reported_fields: frozenset[str] | None = None
+        self.closed = False
+
+    def begin_attempt(self) -> None:
+        """Clear the current snapshot before a distinct backend attempt starts."""
+        self.observed_usage = None
+        self.snapshot_complete = False
+        self.snapshot_terminal_received = False
+        self.snapshot_response_id = None
+        self.snapshot_reported_fields = None
+
+    def note_failure(self, error: BaseException, *, new_attempt: bool = False) -> None:
+        """Observe an exception once, even when several retry layers see it.
+
+        Args:
+            error: Failure of one actual or possibly submitted attempt.
+            new_attempt: Start a new identity even if a caller reused an exception.
+        """
+        from astrbot.core.provider.context_budget import ContextBudgetExceeded
+
+        if isinstance(error, ContextBudgetExceeded):
+            return
+        if getattr(error, "_astrbot_usage_recorded", False):
+            return
+        identity = getattr(error, "_astrbot_usage_attempt_id", None)
+        if (
+            new_attempt
+            or not isinstance(identity, str)
+            or not identity
+            or len(identity) > 128
+        ):
+            identity = str(uuid.uuid4())
+            try:
+                setattr(error, "_astrbot_usage_attempt_id", identity)
+            except (AttributeError, TypeError):
+                identity = f"exception:{id(error)}"
+        if identity in self.errors:
+            return
+        self.errors.add(identity)
+        usage = getattr(error, "_astrbot_token_usage", None)
+        if not _valid_token_usage(usage):
+            usage = self.observed_usage
+        self.observed_usage = None
+        self.snapshot_complete = False
+        self.snapshot_response_id = None
+        self.snapshot_reported_fields = None
+        if not _valid_token_usage(usage):
+            self.unknown = True
+        else:
+            self.usage = (self.usage or TokenUsage()) + usage
+
+    def combined(
+        self, usage: TokenUsage | None, error: BaseException | None = None
+    ) -> TokenUsage | None:
+        """Return ledger totals without changing the response's usage object.
+
+        Args:
+            usage: Final attempt's reported usage, when available.
+            error: Final exception, to avoid counting its observed usage twice.
+
+        Returns:
+            Known total marked partial for unknown attempts, or None if all unknown.
+        """
+        if not _valid_token_usage(usage) or (
+            error is not None and getattr(error, "_astrbot_usage_recorded", False)
+        ):
+            usage = None
+        identity = getattr(error, "_astrbot_usage_attempt_id", None)
+        already_observed = isinstance(identity, str) and identity in self.errors
+        if usage is None and not already_observed:
+            usage = self.observed_usage
+        total = self.usage
+        if not already_observed and usage is not None:
+            total = (total or TokenUsage()) + usage
+        if total is None:
+            return None
+        return TokenUsage(
+            input_other=total.input_other,
+            input_cached=total.input_cached,
+            output=total.output,
+            is_partial=total.is_partial
+            or self.unknown
+            or (usage is None and not already_observed),
+        )
+
+
+current_attempt_ledger: ContextVar[UsageAttemptLedger | None] = ContextVar(
+    "usage_attempt_ledger", default=None
+)
+
+
+def note_failed_attempt(error: BaseException, *, new_attempt: bool = False) -> None:
+    """Add a failed attempt to the current request's independent ledger.
+
+    Args:
+        error: Exception carrying optional backend-reported token usage.
+        new_attempt: Assign a new identity for a newly executed retry attempt.
+    """
+    ledger = current_attempt_ledger.get()
+    if ledger is not None and not ledger.closed:
+        ledger.note_failure(error, new_attempt=new_attempt)
+
+
+def observe_usage_snapshot(
+    usage: TokenUsage | None,
+    *,
+    response_id: str | None = None,
+    complete: bool = False,
+    reported_fields: Collection[str] | None = None,
+) -> None:
+    """Publish a request-local snapshot without recording or summing a new call.
+
+    Args:
+        usage: Host TokenUsage from actual backend fields, never an estimate.
+        response_id: Optional upstream identity for the current response snapshot.
+        complete: Whether this snapshot came from a terminal backend event.
+        reported_fields: Optional input/output direction presence for partial updates.
+
+    This is a no-op outside an instrumented request or after its cleanup. A
+    producer task inherits the mutable request sink when created under the
+    provider call. Producers must publish before their close operation returns.
+    Repeated snapshots replace, never add. Different response IDs alone do not
+    imply extra billable calls; retries use the independent attempt ledger.
+    """
+    ledger = current_attempt_ledger.get()
+    if ledger is None or ledger.closed or not _valid_token_usage(usage):
+        return
+    fields = (
+        frozenset(
+            value
+            for value in reported_fields
+            if isinstance(value, str) and value in {"input", "output"}
+        )
+        if isinstance(reported_fields, Collection)
+        and not isinstance(reported_fields, (str, bytes))
+        else None
+    )
+    if fields == frozenset():
+        return
+    identity = (
+        response_id
+        if isinstance(response_id, str) and len(response_id) <= 256
+        else None
+    )
+    same_response = identity == ledger.snapshot_response_id
+    fully_reported = (
+        bool(complete)
+        and not usage.is_partial
+        and (fields is None or fields == {"input", "output"})
+    )
+    if same_response and ledger.snapshot_complete and not fully_reported:
+        return
+    previous = ledger.observed_usage
+    if (
+        not fully_reported
+        and same_response
+        and fields is not None
+        and previous is not None
+    ):
+        ledger.observed_usage = TokenUsage(
+            input_other=usage.input_other
+            if "input" in fields
+            else previous.input_other,
+            input_cached=usage.input_cached
+            if "input" in fields
+            else previous.input_cached,
+            output=usage.output if "output" in fields else previous.output,
+            is_partial=True,
+        )
+        ledger.snapshot_reported_fields = (
+            ledger.snapshot_reported_fields or frozenset()
+        ) | fields
+    else:
+        ledger.observed_usage = TokenUsage(
+            input_other=usage.input_other,
+            input_cached=usage.input_cached,
+            output=usage.output,
+            is_partial=not fully_reported,
+        )
+        ledger.snapshot_reported_fields = fields or (
+            frozenset({"input", "output"}) if fully_reported else None
+        )
+    ledger.snapshot_complete = fully_reported
+    ledger.snapshot_terminal_received = (
+        ledger.snapshot_terminal_received if same_response else False
+    ) or bool(complete)
+    ledger.snapshot_response_id = identity
+
+
+def observe_attempt_usage(usage: TokenUsage | None, *, complete: bool = False) -> None:
+    """Publish an internal OAuth snapshot through the stable request sink.
+
+    Args:
+        usage: Validated backend counters.
+        complete: Whether the backend event terminated this attempt.
+    """
+    observe_usage_snapshot(usage, complete=complete)
 
 
 _current_usage_context: ContextVar[UsageContext] = ContextVar(
@@ -98,6 +329,8 @@ async def record_usage(
     request_id: str | None = None,
     time_to_first_token: float = 0.0,
     usage_status: str | None = None,
+    replace_snapshot: bool = False,
+    usage_snapshot_fields: frozenset[str] | None = None,
     _context: UsageContext | None = None,
 ) -> None:
     """Write one observed call without changing its business result.
@@ -114,15 +347,18 @@ async def record_usage(
         request_id: Stable idempotency key for this call.
         time_to_first_token: Seconds until first streamed response.
         usage_status: Explicit usage completeness override.
+        replace_snapshot: Opt in to the restricted Realtime terminal-snapshot update.
+        usage_snapshot_fields: Input/output/model fields actually present in a snapshot.
     """
     context = _context or _current_usage_context.get()
+    if not _valid_token_usage(usage):
+        usage = None
     provider_config = getattr(provider, "provider_config", {}) or {}
-    usage_status = usage_status or (
+    usage_status = (
         "missing"
         if usage is None
-        else "partial"
-        if getattr(usage, "is_partial", False)
-        else "reported"
+        else usage_status
+        or ("partial" if getattr(usage, "is_partial", False) else "reported")
     )
     token_usage = usage or TokenUsage()
     try:
@@ -136,12 +372,19 @@ async def record_usage(
                 "request_id": request_id or str(uuid.uuid4()),
                 "trace_id": context.trace_id,
                 "session_umo": context.session_umo,
-                "source_id": provider_config.get("provider_source_id") or None,
+                "source_id": provider_config.get("provider_source_id")
+                or (
+                    provider_config.get("oauth_source_id")
+                    if request_kind == "transcription"
+                    else None
+                ),
                 "plugin_id": context.plugin_id,
                 "request_kind": request_kind,
                 "usage_status": usage_status,
                 "origin_type": context.origin_type or "background",
                 "stat_version": 1,
+                "usage_snapshot": replace_snapshot,
+                "usage_snapshot_fields": sorted(usage_snapshot_fields or ()),
                 "token_usage": {
                     "input_other": token_usage.input_other,
                     "input_cached": token_usage.input_cached,
@@ -184,6 +427,9 @@ def instrument_provider(provider: Any, db: Any) -> Any:
             )
             legacy_token = provider_stats_managed_by_agent.set(True)
             start_time = time.time()
+            ledger = UsageAttemptLedger(id(provider))
+            ledger_token = current_attempt_ledger.set(ledger)
+            final_error = None
             response = None
             usage = None
             status = "completed"
@@ -194,15 +440,24 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                     status = "error"
                 return response
             except BaseException as exc:
+                final_error = exc
                 status = (
                     "aborted" if isinstance(exc, asyncio.CancelledError) else "error"
                 )
-                usage = getattr(exc, "_astrbot_token_usage", None)
+                usage = (
+                    None
+                    if getattr(exc, "_astrbot_usage_recorded", False)
+                    else getattr(exc, "_astrbot_token_usage", None)
+                )
                 raise
             finally:
+                current_attempt_ledger.reset(ledger_token)
                 provider_stats_managed_by_agent.reset(legacy_token)
                 _active_providers.reset(active_token)
                 raw_completion = getattr(response, "raw_completion", None)
+                if response is None and ledger.snapshot_complete:
+                    usage = ledger.observed_usage
+                ledger.closed = True
                 actual_model = (
                     getattr(response, "model", None)
                     or (
@@ -210,19 +465,22 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                         if isinstance(raw_completion, dict)
                         else getattr(raw_completion, "model", None)
                     )
+                    or getattr(final_error, "_astrbot_provider_model", None)
                     or kwargs.get("model")
                 )
                 await record_usage(
                     provider,
                     db,
-                    usage=usage,
+                    usage=ledger.combined(usage, final_error),
                     status=status,
                     start_time=start_time,
                     end_time=time.time(),
                     request_kind=call_context.request_kind or "text",
                     model=actual_model,
                     usage_status="partial"
-                    if status == "aborted" and usage is not None
+                    if status == "aborted"
+                    and usage is not None
+                    and not ledger.snapshot_terminal_received
                     else None,
                     _context=call_context,
                 )
@@ -251,6 +509,9 @@ def instrument_provider(provider: Any, db: Any) -> Any:
             status = "completed"
             response = None
             received_final = False
+            final_usage = None
+            ledger = UsageAttemptLedger(id(provider))
+            final_error = None
             try:
                 while True:
                     provider_key = (id(asyncio.current_task()), id(provider))
@@ -259,20 +520,27 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                         _active_providers.get() | {provider_key}
                     )
                     legacy_token = provider_stats_managed_by_agent.set(True)
+                    ledger_token = current_attempt_ledger.set(ledger)
                     try:
                         response = await anext(stream)
                     except StopAsyncIteration:
                         break
                     finally:
+                        current_attempt_ledger.reset(ledger_token)
                         provider_stats_managed_by_agent.reset(legacy_token)
                         _active_providers.reset(active_token)
                         _current_usage_context.reset(scope_token)
                     if first_token_time == 0.0:
                         first_token_time = time.time() - start_time
-                    if getattr(response, "usage", None) is not None:
+                    if _valid_token_usage(getattr(response, "usage", None)):
                         usage = response.usage
                     if not getattr(response, "is_chunk", False):
                         received_final = True
+                        final_usage = (
+                            response.usage
+                            if _valid_token_usage(getattr(response, "usage", None))
+                            else None
+                        )
                     if getattr(response, "role", None) == "err":
                         status = "error"
                     yield response
@@ -283,12 +551,17 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                     status = "aborted"
                 raise
             except BaseException as exc:
+                final_error = exc
                 if isinstance(exc, asyncio.CancelledError):
                     if not received_final:
                         status = "aborted"
                 else:
                     status = "error"
-                usage = getattr(exc, "_astrbot_token_usage", None) or usage
+                usage = (
+                    None
+                    if getattr(exc, "_astrbot_usage_recorded", False)
+                    else getattr(exc, "_astrbot_token_usage", None)
+                ) or usage
                 raise
             finally:
                 provider_key = (id(asyncio.current_task()), id(provider))
@@ -297,17 +570,24 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                     _active_providers.get() | {provider_key}
                 )
                 legacy_token = provider_stats_managed_by_agent.set(True)
+                ledger_token = current_attempt_ledger.set(ledger)
                 try:
                     await stream.aclose()
                 finally:
+                    current_attempt_ledger.reset(ledger_token)
                     provider_stats_managed_by_agent.reset(legacy_token)
                     _active_providers.reset(active_token)
                     _current_usage_context.reset(scope_token)
                     raw_completion = getattr(response, "raw_completion", None)
+                    if final_usage is not None:
+                        usage = final_usage
+                    elif ledger.observed_usage is not None:
+                        usage = ledger.observed_usage
+                    ledger.closed = True
                     await record_usage(
                         provider,
                         db,
-                        usage=usage,
+                        usage=ledger.combined(usage, final_error),
                         status=status,
                         start_time=start_time,
                         end_time=time.time(),
@@ -318,12 +598,14 @@ def instrument_provider(provider: Any, db: Any) -> Any:
                             if isinstance(raw_completion, dict)
                             else getattr(raw_completion, "model", None)
                         )
+                        or getattr(final_error, "_astrbot_provider_model", None)
                         or kwargs.get("model"),
                         time_to_first_token=first_token_time,
                         usage_status="partial"
                         if status in ("aborted", "error")
                         and not received_final
                         and usage is not None
+                        and not ledger.snapshot_terminal_received
                         else None,
                         _context=call_context,
                     )
