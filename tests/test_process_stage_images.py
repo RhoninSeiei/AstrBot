@@ -20,6 +20,7 @@ from astrbot.core.agent.message import (
     TextPart,
     dump_messages_with_checkpoints,
 )
+from astrbot.core.agent.tool import ToolSet
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.message.components import Image, Plain, Reply
 from astrbot.core.pipeline.preprocess_stage import stage as preprocess
@@ -104,6 +105,7 @@ def harness(tmp_path, monkeypatch):
     )
     context.persona_manager.personas_v3 = []
     context.subagent_orchestrator = None
+    context.get_llm_tool_manager.return_value.get_full_tool_set.side_effect = ToolSet
     context.get_llm_tool_manager.return_value.get_builtin_tool.side_effect = (
         lambda cls, **kwargs: cls(**kwargs)
     )
@@ -120,7 +122,7 @@ def harness(tmp_path, monkeypatch):
         "id": "primary",
         "model": "test",
         "modalities": ["text", "image", "tool_use"],
-        "max_context_tokens": 4096,
+        "max_context_tokens": 128000,
     }
     provider.get_model.return_value = "test"
     provider.text_chat = AsyncMock(
@@ -691,15 +693,15 @@ async def test_unresolved_image_ref_is_reported_not_faked(harness, origin):
     if origin == "component":
         event.message_obj.message = [Image(file=ref)]
     else:
-        event.set_extra("provider_request", ProviderRequest(prompt="", image_urls=[ref]))
+        event.set_extra(
+            "provider_request", ProviderRequest(prompt="", image_urls=[ref])
+        )
 
     await process_event(harness, event, preprocess_first=True)
 
     req = harness.captured[0].req
     payload = harness.provider.text_chat.await_args.kwargs["contexts"][-1]["content"]
-    joined = "\n".join(
-        part["text"] for part in payload if part["type"] == "text"
-    )
+    joined = "\n".join(part["text"] for part in payload if part["type"] == "text")
 
     assert req.image_urls == []
     assert str(Path(ref).resolve()) not in joined
