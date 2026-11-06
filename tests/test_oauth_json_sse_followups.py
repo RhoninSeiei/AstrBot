@@ -1,12 +1,24 @@
 import copy
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 
 import astrbot.core.provider.sources.openai_oauth_source as source
+from astrbot.core.provider.oauth.openai_oauth_sse import (
+    iter_json_sse_events,
+    iter_json_sse_text,
+)
+from tests.test_openai_oauth_image_websocket import (
+    PNG,
+    Session,
+    Socket,
+    image_events,
+    install_sessions,
+)
 from tests.test_openai_oauth_source import _make_provider
 
 
@@ -441,5 +453,63 @@ async def test_image_http_auth_error_body_is_preserved_for_one_refresh(
         assert (await provider._request_image_backend({}))["status"] == "completed"
         assert len(calls) == 2
         refresh.assert_awaited_once()
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keepalive", ["data:\n\n", "data:\ndata:\n\n"])
+async def test_empty_data_keepalive_preserves_following_complete_event(keepalive):
+    expected = _completed()
+    transcript = keepalive + _frame(expected) + keepalive
+
+    async def lines():
+        for line in transcript.splitlines():
+            yield line
+
+    assert list(iter_json_sse_text(transcript)) == [expected]
+    assert [event async for event in iter_json_sse_events(lines())] == [expected]
+    provider = _make_provider()
+    try:
+        response = provider._parse_backend_response(transcript)
+        assert response["status"] == "completed"
+        assert provider._extract_response_usage(response["usage"]).total == 9
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indent", [None, 2], ids=["compact", "pretty"])
+async def test_websocket_json_frame_preserves_generated_image_and_usage(
+    monkeypatch, tmp_path, indent
+):
+    class FormattedSocket(Socket):
+        async def __anext__(self):
+            message = await super().__anext__()
+            message.data = json.dumps(json.loads(message.data), indent=indent)
+            return message
+
+    provider = _make_provider({"generated_image_dir": str(tmp_path)})
+    monkeypatch.setattr(provider, "_ensure_fresh_oauth_token", AsyncMock())
+    socket = FormattedSocket(image_events())
+    session = Session(socket)
+    install_sessions(monkeypatch, [session])
+    recorded = []
+    parse_response = provider._parse_backend_response
+
+    def capture_response(transcript):
+        response = parse_response(transcript)
+        recorded.append(response)
+        return response
+
+    monkeypatch.setattr(provider, "_parse_backend_response", capture_response)
+    try:
+        images = await provider.generate_image("cat", transport="websocket")
+        assert len(images) == 1
+        assert Path(images[0].path).read_bytes() == PNG
+        assert provider._extract_response_usage(recorded[0]["usage"]).total == 3
+        assert len(socket.sent) == 1
+        assert session.closed and socket.closed
+        assert not provider._oauth_stream_clients
     finally:
         await provider.terminate()

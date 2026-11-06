@@ -51,6 +51,8 @@ class _JsonSSEDecoder:
                 payload = "\n".join(self.data_lines)
                 self.data_lines = []
                 self.data_bytes = 0
+                if not payload.strip():
+                    return None
                 if payload.strip() == "[DONE]":
                     self.done = True
                     return None

@@ -1,5 +1,5 @@
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from mcp.types import CallToolResult, TextContent
@@ -122,6 +122,28 @@ async def test_actual_provider_stream_preserves_text_and_rejects_final_bad_call(
             "".join(r.completion_text or "" for r in responses if r.is_chunk)
             == "Preserved text"
         )
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_rejection_diagnostics_and_warning_do_not_reflect_raw_values(monkeypatch):
+    import astrbot.core.provider.sources.openai_oauth_source as source
+
+    warning = Mock()
+    monkeypatch.setattr(source.logger, "warning", warning)
+    provider = _make_provider()
+    raw = completion('{"secret":"PRIVATE_VALUE', text=False)
+    raw["output"][0]["name"] = "tool\nPRIVATE_NAME"
+    raw["output"][0]["call_id"] = "PRIVATE_ID" * 100
+    try:
+        result = await provider._parse_responses_completion(raw, None)
+        assert result.rejected_tool_calls == [
+            {"name": "", "call_id": "", "code": "invalid_json"}
+        ]
+        assert "PRIVATE" not in str(warning.call_args_list)
+        assert "PRIVATE" not in result.completion_text
+        assert result.to_openai_tool_calls_model() == []
     finally:
         await provider.terminate()
 

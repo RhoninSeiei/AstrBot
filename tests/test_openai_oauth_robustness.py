@@ -304,7 +304,7 @@ def test_known_errors_keep_safe_fallback_classification(provider, code, expected
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_tool_parse_failure_preserves_usage_and_is_recorded(provider, streaming):
+async def test_rejected_tool_call_preserves_usage_and_is_recorded(provider, streaming):
     response = {
         "status": "completed",
         "usage": {"input_tokens": 8, "output_tokens": 3},
@@ -323,15 +323,18 @@ async def test_tool_parse_failure_preserves_usage_and_is_recorded(provider, stre
         yield {"type": "response.completed", "response": response}
 
     provider._stream_backend_events = events
-    with pytest.raises(ValueError) as caught:
-        if streaming:
-            _ = [item async for item in provider.text_chat_stream(prompt="synthetic")]
-        else:
-            await provider.text_chat(prompt="synthetic")
-    assert "SECRET_ARGUMENT" not in str(caught.value)
-    assert caught.value._astrbot_token_usage.total == 11
+    if streaming:
+        items = [item async for item in provider.text_chat_stream(prompt="synthetic")]
+        result = items[-1]
+    else:
+        result = await provider.text_chat(prompt="synthetic")
+    assert result.tools_call_args == []
+    assert result.rejected_tool_calls[0]["code"] == "invalid_json"
+    assert "SECRET_ARGUMENT" not in str(result.rejected_tool_calls)
+    assert "SECRET_ARGUMENT" not in result.completion_text
+    assert result.usage.total == 11
     assert provider._record_provider_stat.await_args.kwargs["usage"].total == 11
-    assert provider._record_provider_stat.await_args.kwargs["status"] == "error"
+    assert provider._record_provider_stat.await_args.kwargs["status"] == "completed"
 
 
 @pytest.mark.parametrize("route", ["http", "sse", "stream", "completion", "image"])

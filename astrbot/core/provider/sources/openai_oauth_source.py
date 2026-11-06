@@ -17,10 +17,6 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 import httpx
-from astrbot.core.provider.oauth.tool_arguments import (
-    parse_tool_arguments,
-    rejected_tool_call,
-)
 
 from astrbot import logger
 from astrbot.core import db_helper
@@ -37,6 +33,10 @@ from astrbot.core.provider.oauth.openai_oauth_shared_state import (
 from astrbot.core.provider.oauth.openai_oauth_sse import (
     iter_json_sse_events,
     iter_json_sse_text,
+)
+from astrbot.core.provider.oauth.tool_arguments import (
+    parse_tool_arguments,
+    rejected_tool_call,
 )
 from astrbot.core.provider.provider import provider_stats_managed_by_agent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -877,7 +877,13 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                                 event = json.loads(message.data)
                                 if not isinstance(event, dict):
                                     raise OpenAIOAuthImageStreamError("outcome_unknown")
-                                lines.append("data: " + message.data + "\n")
+                                lines.append(
+                                    "data: "
+                                    + json.dumps(
+                                        event, ensure_ascii=False, separators=(",", ":")
+                                    )
+                                    + "\n"
+                                )
                                 event_type = event.get("type")
                                 if event_type in {
                                     "error",
