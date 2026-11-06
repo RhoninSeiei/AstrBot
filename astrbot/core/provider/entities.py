@@ -476,6 +476,8 @@ class LLMResponse:
     """Tool call IDs."""
     tools_call_extra_content: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Tool call extra content. tool_call_id -> extra_content dict"""
+    rejected_tool_calls: list[dict[str, str]] = field(default_factory=list)
+    """Non-executable tool diagnostics; never contains original arguments."""
     reasoning_content: str | None = None
     """The reasoning content extracted from the LLM, if any."""
     reasoning_signature: str | None = None
@@ -519,6 +521,7 @@ class LLMResponse:
         id: str | None = None,
         usage: TokenUsage | None = None,
         status_code: int | None = None,
+        rejected_tool_calls: list[dict[str, str]] | None = None,
     ) -> None:
         """初始化 LLMResponse
 
@@ -547,6 +550,7 @@ class LLMResponse:
         self.tools_call_name = tools_call_name
         self.tools_call_ids = tools_call_ids
         self.tools_call_extra_content = tools_call_extra_content
+        self.rejected_tool_calls = list(rejected_tool_calls or [])
         self.reasoning_content = reasoning_content
         self.reasoning_signature = reasoning_signature
         self.raw_completion = raw_completion

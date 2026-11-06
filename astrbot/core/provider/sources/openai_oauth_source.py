@@ -17,6 +17,10 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 import httpx
+from astrbot.core.provider.oauth.tool_arguments import (
+    parse_tool_arguments,
+    rejected_tool_call,
+)
 
 from astrbot import logger
 from astrbot.core import db_helper
@@ -30,7 +34,10 @@ from astrbot.core.provider.oauth.openai_oauth_audio import OpenAIOAuthAudioMixin
 from astrbot.core.provider.oauth.openai_oauth_shared_state import (
     OpenAIOAuthSharedState,
 )
-from astrbot.core.provider.oauth.openai_oauth_sse import iter_json_sse_events
+from astrbot.core.provider.oauth.openai_oauth_sse import (
+    iter_json_sse_events,
+    iter_json_sse_text,
+)
 from astrbot.core.provider.provider import provider_stats_managed_by_agent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -703,29 +710,38 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                 headers=headers,
                 json=payload,
             ) as response:
-                async for line in response.aiter_lines():
-                    text_parts.append(line)
-                    stripped = line.strip()
-                    if not stripped.startswith("data:"):
-                        continue
-                    raw = stripped[5:].strip()
-                    if not raw:
-                        continue
-                    if raw == "[DONE]":
-                        break
+                if response.status_code < 200 or response.status_code >= 300:
+                    text_parts.append(
+                        (await response.aread()).decode("utf-8", errors="replace")
+                    )
+                else:
+
+                    async def captured_lines():
+                        async for line in response.aiter_lines():
+                            text_parts.append(line)
+                            yield line
+
                     try:
-                        event = json.loads(raw)
-                    except Exception:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    event_type = event.get("type")
-                    if event_type in {
-                        "response.completed",
-                        "response.error",
-                        "response.failed",
-                    }:
-                        break
+                        async with aclosing(
+                            iter_json_sse_events(
+                                captured_lines(),
+                                max_event_bytes=IMAGE_WEBSOCKET_MAX_MESSAGE_BYTES,
+                            )
+                        ) as events:
+                            async for event in events:
+                                if event.get("type") in {
+                                    "response.completed",
+                                    "response.error",
+                                    "response.failed",
+                                    "response.incomplete",
+                                    "error",
+                                }:
+                                    break
+                    except ValueError:
+                        logger.warning("Codex backend SSE rejected 1 invalid event.")
+                        raise ValueError(
+                            "Codex backend SSE event is invalid."
+                        ) from None
 
         return response.status_code, "\n".join(text_parts), attempted_version
 
@@ -861,7 +877,7 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                                 event = json.loads(message.data)
                                 if not isinstance(event, dict):
                                     raise OpenAIOAuthImageStreamError("outcome_unknown")
-                                lines.append("data: " + message.data)
+                                lines.append("data: " + message.data + "\n")
                                 event_type = event.get("type")
                                 if event_type in {
                                     "error",
@@ -1068,57 +1084,45 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         output_text_done: str | None = None
         output_items: list[dict[str, Any]] = []
         output_item_ids: set[str] = set()
-        malformed_data_lines = 0
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("data:"):
-                continue
-            raw = line[5:].strip()
-            if not raw or raw == "[DONE]":
-                continue
-            try:
-                event = json.loads(raw)
-            except (ValueError, TypeError):
-                malformed_data_lines += 1
-                continue
-            if not isinstance(event, dict):
-                malformed_data_lines += 1
-                continue
-            event_type = event.get("type")
-            if event_type in {
-                "error",
-                "response.error",
-                "response.failed",
-                "response.incomplete",
-            }:
-                error_payload = event
-            elif event_type == "response.output_text.delta":
-                delta = event.get("delta")
-                if delta:
-                    output_text_parts.append(str(delta))
-            elif event_type == "response.output_text.done":
-                text_value = event.get("text")
-                if text_value is not None:
-                    output_text_done = str(text_value)
-            elif event_type == "response.output_item.done":
-                item = event.get("item")
-                if isinstance(item, dict):
-                    item_id = str(item.get("id") or "")
-                    dedupe_key = item_id or f"index:{len(output_items)}"
-                    if dedupe_key not in output_item_ids:
-                        output_item_ids.add(dedupe_key)
-                        output_items.append(item)
-            if event_type == "response.completed":
-                response = event.get("response")
-                if isinstance(response, dict):
-                    completed_response = response
-                else:
-                    completed_response = event
-        if malformed_data_lines:
-            logger.warning(
-                "Codex backend SSE skipped %d malformed data lines.",
-                malformed_data_lines,
-            )
+        try:
+            for event in iter_json_sse_text(
+                text, max_event_bytes=IMAGE_WEBSOCKET_MAX_MESSAGE_BYTES
+            ):
+                event_type = event.get("type")
+                if event_type in {
+                    "error",
+                    "response.error",
+                    "response.failed",
+                    "response.incomplete",
+                }:
+                    error_payload = event
+                    break
+                elif event_type == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if delta:
+                        output_text_parts.append(str(delta))
+                elif event_type == "response.output_text.done":
+                    text_value = event.get("text")
+                    if text_value is not None:
+                        output_text_done = str(text_value)
+                elif event_type == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict):
+                        item_id = str(item.get("id") or "")
+                        dedupe_key = item_id or f"index:{len(output_items)}"
+                        if dedupe_key not in output_item_ids:
+                            output_item_ids.add(dedupe_key)
+                            output_items.append(item)
+                if event_type == "response.completed":
+                    response = event.get("response")
+                    if isinstance(response, dict):
+                        completed_response = response
+                    else:
+                        completed_response = event
+                    break
+        except ValueError:
+            logger.warning("Codex backend SSE rejected 1 invalid event.")
+            raise ValueError("Codex backend SSE event is invalid.") from None
         if error_payload:
             raise self._backend_response_error(
                 error_payload, "Codex backend returned error event"
@@ -1665,6 +1669,50 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     params.pop("include", None)
             elif include == "message.output_text.logprobs":
                 params.pop("include", None)
+        text_options = params.get("text")
+        if (
+            isinstance(text_options, dict)
+            and isinstance(text_options.get("format"), dict)
+            and text_options["format"].get("type") == "json_object"
+        ):
+            input_has_json = False
+            for item in params["input"]:
+                if item.get("type") != "message":
+                    continue
+                content = item.get("content")
+                if isinstance(content, str):
+                    input_has_json = "json" in content.casefold()
+                elif isinstance(content, list):
+                    input_has_json = any(
+                        isinstance(part, dict)
+                        and part.get("type") == "input_text"
+                        and "json" in str(part.get("text") or "").casefold()
+                        for part in content
+                    )
+                if input_has_json:
+                    break
+            if not input_has_json:
+                hint = {"type": "input_text", "text": "Respond with a JSON object."}
+                for index in range(len(params["input"]) - 1, -1, -1):
+                    item = params["input"][index]
+                    if item.get("type") != "message" or item.get("role") != "user":
+                        continue
+                    content = item.get("content")
+                    parts = (
+                        list(content)
+                        if isinstance(content, list)
+                        else (
+                            [{"type": "input_text", "text": content}]
+                            if isinstance(content, str) and content
+                            else []
+                        )
+                    )
+                    params["input"][index] = {**item, "content": [*parts, hint]}
+                    break
+                else:
+                    params["input"].append(
+                        {"type": "message", "role": "user", "content": [hint]}
+                    )
         return params
 
     @staticmethod
@@ -1760,22 +1808,25 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                         reasoning_parts.append(str(text))
             elif item_type == "function_call":
                 arguments = (
-                    item.get("arguments", "{}")
+                    item.get("arguments")
                     if isinstance(item, dict)
-                    else getattr(item, "arguments", "{}")
+                    else getattr(item, "arguments", None)
                 )
-                try:
-                    parsed_args = (
-                        json.loads(arguments)
-                        if isinstance(arguments, str)
-                        else arguments
+                parsed_args, rejection_code = parse_tool_arguments(arguments)
+                if rejection_code is not None:
+                    llm_response.rejected_tool_calls.append(
+                        rejected_tool_call(
+                            item.get("name")
+                            if isinstance(item, dict)
+                            else getattr(item, "name", None),
+                            item.get("call_id")
+                            if isinstance(item, dict)
+                            else getattr(item, "call_id", None),
+                            rejection_code,
+                        )
                     )
-                except (ValueError, TypeError):
-                    raise ValueError(
-                        "Codex tool arguments must contain a JSON object."
-                    ) from None
-                if not isinstance(parsed_args, dict):
-                    raise ValueError("Codex tool arguments must contain a JSON object.")
+                    continue
+                assert parsed_args is not None
                 tool_args.append(parsed_args)
                 tool_names.append(
                     str(
@@ -1817,6 +1868,15 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     message_text_parts.append("".join(item_text_parts).strip())
 
         output_text = output_text or "\n".join(message_text_parts)
+        if llm_response.rejected_tool_calls:
+            logger.warning(
+                "Codex rejected %d tool calls with invalid arguments before execution.",
+                len(llm_response.rejected_tool_calls),
+            )
+            if not output_text and not tool_args:
+                output_text = (
+                    "Tool calls were not executed because their arguments were invalid."
+                )
         citations = self._extract_url_citations(response)
         if output_text:
             if citations:

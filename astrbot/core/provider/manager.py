@@ -1136,27 +1136,28 @@ class ProviderManager:
             f"{len(self.tts_provider_insts)}) ...",
         )
 
-        if prov_inst in self.provider_insts:
-            if isinstance(prov_inst, Provider):
-                self.provider_insts.remove(prov_inst)
-        if prov_inst in self.stt_provider_insts:
-            if isinstance(prov_inst, STTProvider):
-                self.stt_provider_insts.remove(prov_inst)
-        if prov_inst in self.tts_provider_insts:
-            if isinstance(prov_inst, TTSProvider):
-                self.tts_provider_insts.remove(prov_inst)
-        if prov_inst in self.decision_provider_insts:
-            if isinstance(prov_inst, DecisionProvider):
-                self.decision_provider_insts.remove(prov_inst)
-
-        if prov_inst == self.curr_provider_inst:
-            self.curr_provider_inst = None
-        if prov_inst == self.curr_stt_provider_inst:
-            self.curr_stt_provider_inst = None
-        if prov_inst == self.curr_tts_provider_inst:
-            self.curr_tts_provider_inst = None
-        if prov_inst == self.curr_decision_provider_inst:
-            self.curr_decision_provider_inst = None
+        # Detach every identity reference before cleanup can await, fail, or be
+        # cancelled. A replacement registered during cleanup must remain intact.
+        for instances in (
+            self.provider_insts,
+            self.stt_provider_insts,
+            self.tts_provider_insts,
+            self.embedding_provider_insts,
+            self.rerank_provider_insts,
+            self.decision_provider_insts,
+        ):
+            instances[:] = [inst for inst in instances if inst is not prov_inst]
+        for current_attr in (
+            "curr_provider_inst",
+            "curr_stt_provider_inst",
+            "curr_tts_provider_inst",
+            "curr_decision_provider_inst",
+        ):
+            if getattr(self, current_attr) is prov_inst:
+                setattr(self, current_attr, None)
+        for registered_id, inst in list(self.inst_map.items()):
+            if inst is prov_inst:
+                del self.inst_map[registered_id]
 
         if getattr(prov_inst, "terminate", None):
             await prov_inst.terminate()  # type: ignore
@@ -1166,7 +1167,6 @@ class ProviderManager:
             f"({len(self.provider_insts)}, {len(self.stt_provider_insts)}, "
             f"{len(self.tts_provider_insts)})",
         )
-        del self.inst_map[provider_id]
 
     async def delete_provider(
         self, provider_id: str | None = None, provider_source_id: str | None = None

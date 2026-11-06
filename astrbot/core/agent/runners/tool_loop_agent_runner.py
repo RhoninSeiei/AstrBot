@@ -214,6 +214,56 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             logger.error(f"Error in on_agent_done hook: {e}", exc_info=True)
         self._resolve_unconsumed_follow_ups()
 
+    def _can_repair_tool_rejections(self, response: LLMResponse) -> bool:
+        return bool(
+            response.rejected_tool_calls
+            and self._func_tool_for_provider()
+            and not self._is_stop_requested()
+            and (
+                self._step_budget_max is None
+                or self._step_budget_used < self._step_budget_max
+            )
+        )
+
+    def _append_tool_rejection_notice(
+        self, response: LLMResponse, *, include_assistant: bool = False
+    ) -> None:
+        # Diagnostics are separate from executable calls and never carry raw arguments.
+        if include_assistant:
+            self.run_context.messages.append(
+                Message(
+                    role="assistant",
+                    content=[
+                        TextPart(
+                            text=response.completion_text
+                            or "Tool arguments were rejected."
+                        )
+                    ],
+                )
+            )
+        rejected_names = []
+        for item in response.rejected_tool_calls[:32]:
+            name = item.get("name", "")
+            if (
+                isinstance(name, str)
+                and 0 < len(name) <= 128
+                and all(
+                    char.isascii() and (char.isalnum() or char in "_-.")
+                    for char in name
+                )
+            ):
+                rejected_names.append(name)
+        notice = (
+            "[tool_argument_validation] Some tool calls were rejected before execution: "
+            + ", ".join(rejected_names)
+            + ". Supply a complete JSON object with finite JSON values for each call. "
+            "If tools remain available, only retry rejected calls; do not repeat calls "
+            "whose results are already present. Otherwise report the rejected calls as incomplete."
+        )
+        self.run_context.messages.append(
+            Message(role="user", content=[TextPart(text=notice)])
+        )
+
     @override
     async def reset(
         self,
@@ -1077,7 +1127,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             return
 
-        if not llm_resp.tools_call_name:
+        if not llm_resp.tools_call_name and not self._can_repair_tool_rejections(
+            llm_resp
+        ):
             await self._complete_with_assistant_response(llm_resp)
 
         # 返回 LLM 结果
@@ -1103,15 +1155,29 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 ),
             )
 
+        if not llm_resp.tools_call_name and self._can_repair_tool_rejections(llm_resp):
+            self._append_tool_rejection_notice(llm_resp, include_assistant=True)
+            return
+
         # 如果有工具调用，还需处理工具调用
         if llm_resp.tools_call_name:
             if self.tool_schema_mode == "skills_like":
                 requery_resp, _ = await self._resolve_tool_exec(llm_resp)
+                rejections = list(llm_resp.rejected_tool_calls)
+                for rejection in requery_resp.rejected_tool_calls:
+                    if rejection not in rejections:
+                        rejections.append(rejection)
+                requery_resp.rejected_tool_calls = rejections
                 if self._is_stop_requested():
                     yield await self._finalize_aborted_step()
                     return
                 if not requery_resp.tools_call_name:
                     llm_resp = requery_resp
+                    if self._can_repair_tool_rejections(llm_resp):
+                        self._append_tool_rejection_notice(
+                            llm_resp, include_assistant=True
+                        )
+                        return
                     logger.warning(
                         "skills_like tool re-query returned no tool calls; fallback to assistant response."
                     )
@@ -1163,6 +1229,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     llm_resp.tools_call_name = requery_resp.tools_call_name
                     llm_resp.tools_call_args = requery_resp.tools_call_args
                     llm_resp.tools_call_ids = requery_resp.tools_call_ids
+                    llm_resp.rejected_tool_calls = requery_resp.rejected_tool_calls
 
             tool_call_result_blocks = []
             cached_images = []  # Collect cached images for LLM visibility
@@ -1259,6 +1326,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             self.run_context.messages.extend(
                 tool_calls_result.to_openai_messages_model()
             )
+            if llm_resp.rejected_tool_calls:
+                self._append_tool_rejection_notice(llm_resp)
 
             # If there are cached images and the model supports image input,
             # append a user message with images so LLM can see them

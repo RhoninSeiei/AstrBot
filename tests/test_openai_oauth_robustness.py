@@ -241,8 +241,13 @@ async def test_invalid_tool_arguments_never_become_executable_empty_args(
             }
         ],
     }
-    with pytest.raises(ValueError, match="tool arguments"):
-        await provider._parse_responses_completion(response, None)
+    result = await provider._parse_responses_completion(response, None)
+    assert result.tools_call_name == []
+    assert result.tools_call_args == []
+    assert result.tools_call_ids == []
+    assert result.to_openai_tool_calls_model() == []
+    assert result.rejected_tool_calls[0]["name"] == "synthetic_tool"
+    assert result.rejected_tool_calls[0]["call_id"] == "synthetic-call"
 
 
 @pytest.mark.asyncio
@@ -465,7 +470,7 @@ def test_rate_limit_error_keeps_status_without_raw_error(provider):
     assert caught.value._astrbot_token_usage.total == 8
 
 
-def test_non_stream_malformed_lines_are_reported_once_without_raw_data(
+def test_non_stream_malformed_event_is_rejected_once_without_raw_data(
     provider, monkeypatch
 ):
     warning = Mock()
@@ -474,13 +479,17 @@ def test_non_stream_malformed_lines_are_reported_once_without_raw_data(
         [
             'data: {"SECRET":',
             "data: not-json-SECRET",
+            "",
             "data: "
             + json.dumps({"type": "response.completed", "response": completion()}),
+            "",
         ]
     )
-    assert provider._parse_backend_response(text)["status"] == "completed"
+    with pytest.raises(ValueError) as caught:
+        provider._parse_backend_response(text)
+    assert "SECRET" not in str(caught.value)
     warning.assert_called_once()
-    assert "2" in str(warning.call_args)
+    assert "1" in str(warning.call_args)
     assert "SECRET" not in str(warning.call_args)
 
 
