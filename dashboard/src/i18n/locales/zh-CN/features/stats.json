@@ -6,14 +6,14 @@
     "notUpdated": "尚未更新"
   },
   "ranges": {
-    "oneDay": "1 天",
-    "threeDays": "3 天",
-    "oneWeek": "1 周"
+    "oneDay": "24 小时",
+    "threeDays": "72 小时",
+    "oneWeek": "7 天"
   },
   "rangeLabels": {
-    "oneDay": "最近 1 天",
-    "threeDays": "最近 3 天",
-    "oneWeek": "最近 1 周"
+    "oneDay": "过去 24 小时",
+    "threeDays": "过去 72 小时",
+    "oneWeek": "过去 7 天"
   },
   "overviewCards": {
     "platformCount": {
@@ -25,8 +25,8 @@
       "note": "累计消息量"
     },
     "todayModelCalls": {
-      "label": "今日模型调用",
-      "note": "Tokens"
+      "label": "今日 Token 用量",
+      "note": "服务器时区 00:00 起"
     },
     "cpu": {
       "label": "CPU",
@@ -58,11 +58,11 @@
     "title": "模型调用趋势"
   },
   "modelTotal": {
-    "title": "{range}模型调用总量",
+    "title": "{range} Token 用量",
     "callCount": "共 {count} 次调用",
     "callBreakdown": "代理 {agent} · 直接调用 {provider} · 检查 {test} · 其他 {other}",
     "tokenBreakdown": "非缓存输入 {input} · 缓存输入 {cached} · 输出 {output}",
-    "usageCoverage": "新调用用量覆盖率 {coverage} · 部分上报 {partial} 次 · 未上报 {missing} 次",
+    "usageCoverage": "用量上报覆盖率 {coverage} · 部分上报 {partial} 次 · 未上报 {missing} 次",
     "recordedHistory": "新调用已报告 {newTokens} · 历史记录 {legacyTokens}",
     "quotaNote": "Token 记录不等于 OAuth 订阅额度；历史漏计无法回填。",
     "scopeLabel": "统计口径说明",
@@ -70,7 +70,9 @@
     "avgTtft": "平均首字延迟（TTFT）",
     "avgDuration": "平均响应时间",
     "avgTpm": "平均每分钟输出（TPM）",
-    "successRate": "调用成功率"
+    "successRate": "调用成功率",
+    "windowNote": "截至当前时刻的滚动范围，与上方今日统计不同。",
+    "coverageNote": "覆盖率表示已记录调用中收到用量数据的比例；取消或失败时未上报的消耗仍未知。"
   },
   "modelRanking": {
     "title": "模型用量排名"

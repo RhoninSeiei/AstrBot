@@ -158,7 +158,9 @@ Select `Data & Logs` in the left sidebar to switch between `Statistics`, `Conver
 
 ### Statistics
 
-The `Statistics` tab summarizes platform instances, messages, model calls, tokens, and uptime. It also shows message trends, platform message rankings, model-call trends, model usage rankings, and conversation model usage rankings. Use the range selector at the top to view 1 day, 3 days, or 1 week.
+The former “Today model calls” card is now “Today’s token usage”, counted from 00:00 in the server timezone. “Last 1 day” is now explicitly “Past 24 hours”; the selector offers rolling windows of 24 hours, 72 hours and 7 days, independently of the calendar-day card. Usage reporting coverage is the share of recorded calls with complete or partial usage data. Calls without usage are still recorded, and their consumption must not be treated as zero.
+
+The `Statistics` tab summarizes platform instances, messages, model calls, tokens, and uptime. It also shows message trends, platform message rankings, model-call trends, model usage rankings, and conversation model usage rankings. Use the range selector at the top to view the past 24 hours, 72 hours, or 7 days.
 
 ### Conversations
 

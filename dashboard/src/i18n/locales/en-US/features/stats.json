@@ -6,14 +6,14 @@
     "notUpdated": "Not updated yet"
   },
   "ranges": {
-    "oneDay": "1 Day",
-    "threeDays": "3 Days",
-    "oneWeek": "1 Week"
+    "oneDay": "24 hours",
+    "threeDays": "72 hours",
+    "oneWeek": "7 days"
   },
   "rangeLabels": {
-    "oneDay": "Last 1 day",
-    "threeDays": "Last 3 days",
-    "oneWeek": "Last 1 week"
+    "oneDay": "Past 24 hours",
+    "threeDays": "Past 72 hours",
+    "oneWeek": "Past 7 days"
   },
   "overviewCards": {
     "platformCount": {
@@ -25,8 +25,8 @@
       "note": "Total accumulated messages"
     },
     "todayModelCalls": {
-      "label": "Today's Model Calls",
-      "note": "Tokens"
+      "label": "Today's token usage",
+      "note": "Since 00:00 in server time"
     },
     "cpu": {
       "label": "CPU",
@@ -58,11 +58,11 @@
     "title": "Model Call Trend"
   },
   "modelTotal": {
-    "title": "{range} total model calls",
+    "title": "Token usage · {range}",
     "callCount": "{count} calls",
     "callBreakdown": "Agent {agent} · direct {provider} · test {test} · other {other}",
     "tokenBreakdown": "Uncached input {input} · cached input {cached} · output {output}",
-    "usageCoverage": "New-call usage coverage {coverage} · {partial} partial · {missing} without usage",
+    "usageCoverage": "Usage reporting coverage {coverage} · Partial {partial} · Missing {missing}",
     "recordedHistory": "New reported {newTokens} · historical records {legacyTokens}",
     "quotaNote": "Recorded tokens differ from OAuth subscription usage. Missing historical usage cannot be recovered.",
     "scopeLabel": "Usage scope",
@@ -70,7 +70,9 @@
     "avgTtft": "Average TTFT",
     "avgDuration": "Average Response Time",
     "avgTpm": "Average Output TPM",
-    "successRate": "Success Rate"
+    "successRate": "Success Rate",
+    "windowNote": "Rolling window ending now, unlike the calendar-day total above.",
+    "coverageNote": "Coverage is the share of recorded calls with usage data. Consumption remains unknown when a cancelled or failed call reports none."
   },
   "modelRanking": {
     "title": "Model Usage Ranking"

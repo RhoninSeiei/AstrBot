@@ -26,6 +26,7 @@
             </div>
             <div class="card-label">{{ card.label }}</div>
             <div class="card-value">{{ card.value }}</div>
+            <div v-if="card.note" class="card-note">{{ card.note }}</div>
           </section>
         </div>
 
@@ -121,6 +122,7 @@
           <section class="token-side-column">
             <section class="stat-card token-total-card">
               <div class="card-label">{{ t('modelTotal.title', { range: rangeLabel }) }}</div>
+              <div class="card-note">{{ t('modelTotal.windowNote') }}</div>
               <div class="token-total-value">{{ formatNumber(providerStats?.range_total_tokens ?? 0) }} <span style="font-size: 18px;">{{ t('units.tokens') }}</span></div>
               <div class="card-note">{{ t('modelTotal.callCount', { count: formatNumber(providerStats?.range_total_calls ?? 0) }) }}</div>
               <div class="card-note call-breakdown">
@@ -141,6 +143,7 @@
                 partial: formatNumber(providerStats?.range_usage?.partial_calls ?? 0),
                 missing: formatNumber(providerStats?.range_usage?.missing_calls ?? 0)
               }) }}</div>
+              <div class="card-note">{{ t('modelTotal.coverageNote') }}</div>
               <div class="card-note">{{ t('modelTotal.recordedHistory', {
                 newTokens: formatNumber(providerStats?.range_usage?.reported_tokens ?? 0),
                 legacyTokens: formatNumber(providerStats?.range_usage?.legacy_tokens ?? 0)
@@ -617,6 +620,7 @@ const overviewCards = computed(() => [
   {
     label: t('overviewCards.todayModelCalls.label'),
     value: formatCompactNumber(providerStats.value?.today_total_tokens ?? 0),
+    note: t('overviewCards.todayModelCalls.note'),
     icon: 'mdi-creation-outline'
   },
   {

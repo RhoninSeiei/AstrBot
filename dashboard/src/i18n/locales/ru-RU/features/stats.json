@@ -6,14 +6,14 @@
     "notUpdated": "Еще не обновлялось"
   },
   "ranges": {
-    "oneDay": "1 день",
-    "threeDays": "3 дня",
-    "oneWeek": "1 неделя"
+    "oneDay": "24 часа",
+    "threeDays": "72 часа",
+    "oneWeek": "7 дней"
   },
   "rangeLabels": {
-    "oneDay": "За 1 день",
-    "threeDays": "За 3 дня",
-    "oneWeek": "За 1 неделю"
+    "oneDay": "Последние 24 часа",
+    "threeDays": "Последние 72 часа",
+    "oneWeek": "Последние 7 дней"
   },
   "overviewCards": {
     "platformCount": {
@@ -25,8 +25,8 @@
       "note": "Общее число сообщений"
     },
     "todayModelCalls": {
-      "label": "Вызовы моделей сегодня",
-      "note": "Tokens"
+      "label": "Токены за сегодня",
+      "note": "С 00:00 по времени сервера"
     },
     "cpu": {
       "label": "CPU",
@@ -58,11 +58,11 @@
     "title": "Динамика вызовов моделей"
   },
   "modelTotal": {
-    "title": "{range} всего вызовов моделей",
+    "title": "Использование токенов · {range}",
     "callCount": "{count} вызовов",
     "callBreakdown": "Агент {agent} · прямые {provider} · проверка {test} · прочие {other}",
     "tokenBreakdown": "Ввод без кэша {input} · кэшированный ввод {cached} · вывод {output}",
-    "usageCoverage": "Покрытие новых вызовов {coverage} · частичные данные {partial} · без данных {missing}",
+    "usageCoverage": "Доля вызовов с данными об использовании {coverage} · Частичные {partial} · Без данных {missing}",
     "recordedHistory": "Новые отчёты {newTokens} · прежние записи {legacyTokens}",
     "quotaNote": "Учтённые токены отличаются от расхода лимита подписки OAuth. Исторические пропуски восстановить нельзя.",
     "scopeLabel": "Область учёта",
@@ -70,7 +70,9 @@
     "avgTtft": "Средний TTFT",
     "avgDuration": "Среднее время ответа",
     "avgTpm": "Средний Output TPM",
-    "successRate": "Доля успешных вызовов"
+    "successRate": "Доля успешных вызовов",
+    "windowNote": "Скользящий период до текущего момента, в отличие от итога за сегодня выше.",
+    "coverageNote": "Доля учитывает записанные вызовы, для которых получены данные об использовании. Если отменённый или неудачный вызов их не вернул, расход неизвестен."
   },
   "modelRanking": {
     "title": "Рейтинг использования моделей"
