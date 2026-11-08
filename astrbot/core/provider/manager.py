@@ -650,6 +650,10 @@ class ProviderManager:
                 from .sources.system_one_decision_source import (
                     SystemOneDecisionProvider as SystemOneDecisionProvider,
                 )
+            case "openai_decision":
+                from .sources.openai_decision_source import (
+                    OpenAIDecisionProvider as OpenAIDecisionProvider,
+                )
 
     async def _persist_openai_oauth_provider_source_patch(
         self,
