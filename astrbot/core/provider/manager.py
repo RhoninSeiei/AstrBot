@@ -24,7 +24,7 @@ from .provider import (
     TTSProvider,
 )
 from .register import llm_tools, provider_cls_map
-from .usage_recorder import instrument_provider
+from .usage_recorder import instrument_decision_provider, instrument_provider
 
 if TYPE_CHECKING:
     from ..persona_mgr import PersonaManager
@@ -1047,6 +1047,7 @@ class ProviderManager:
                     inst = cls_type(provider_config, self.provider_settings)
                     if isinstance(inst, HasInitialize):
                         await inst.initialize()
+                    instrument_decision_provider(inst, self.db_helper)
                     self.decision_provider_insts.append(inst)
                     if not self.curr_decision_provider_inst:
                         self.curr_decision_provider_inst = inst

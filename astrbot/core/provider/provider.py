@@ -491,8 +491,11 @@ class DecisionProvider(AbstractProvider):
         return [model] if model else []
 
     async def test(self) -> None:
-        await self.ask(
-            {"test": DecisionBooleanQuestion("Is this provider available?")},
-            {},
-            request_max_retries=0,
-        )
+        from astrbot.core.provider.usage_recorder import usage_scope
+
+        with usage_scope(request_kind="test", origin_type="test"):
+            await self.ask(
+                {"test": DecisionBooleanQuestion("Is this provider available?")},
+                {},
+                request_max_retries=0,
+            )

@@ -13,7 +13,7 @@ from functools import wraps
 from typing import Any
 
 from astrbot import logger
-from astrbot.core.provider.entities import TokenUsage
+from astrbot.core.provider.entities import DecisionUsage, TokenUsage
 from astrbot.core.provider.provider import provider_stats_managed_by_agent
 
 
@@ -456,6 +456,121 @@ async def record_usage(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Persist provider usage failed: %s", exc, exc_info=True)
+
+
+def instrument_decision_provider(provider: Any, db: Any) -> Any:
+    """Observe direct and service-mediated calls on a managed decision provider.
+
+    Args:
+        provider: Decision provider instance to instrument in place.
+        db: Database for the usage ledger.
+
+    Returns:
+        The same provider instance, preserving its answer and exception contracts.
+    """
+    original_ask = provider.ask
+    if getattr(original_ask, "_astrbot_usage_wrapped", False) is True:
+        return provider
+
+    @wraps(original_ask)
+    async def wrapped_ask(*args: Any, **kwargs: Any):
+        provider_key = (id(asyncio.current_task()), id(provider))
+        if provider_key in _active_providers.get():
+            return await original_ask(*args, **kwargs)
+        call_context = _current_usage_context.get()
+        active_token = _active_providers.set(_active_providers.get() | {provider_key})
+        # Native Decisions carries all attempts in its own request-local result.
+        # Shared retry helpers must not reset or add to an enclosing chat ledger.
+        ledger_token = current_attempt_ledger.set(None)
+        start_time = time.time()
+        response = None
+        final_error = None
+        status = "completed"
+        try:
+            response = await original_ask(*args, **kwargs)
+            if response is None:
+                status = "error"
+            return response
+        except BaseException as error:
+            final_error = error
+            status = "aborted" if isinstance(error, asyncio.CancelledError) else "error"
+            raise
+        finally:
+            current_attempt_ledger.reset(ledger_token)
+            _active_providers.reset(active_token)
+            subject = response if response is not None else final_error
+            attempts = getattr(subject, "attempt_usages", ())
+            # A nonempty attempt sequence already includes the final response.
+            observations = (
+                attempts
+                if isinstance(attempts, (tuple, list)) and attempts
+                else (getattr(subject, "usage", None),)
+            )
+            total = None
+            unknown = False
+            for observed in observations:
+                if not isinstance(observed, DecisionUsage) or any(
+                    value is not None
+                    and (type(value) is not int or not 0 <= value <= 2**63 - 1)
+                    for value in (
+                        observed.input_tokens,
+                        observed.cached_tokens,
+                        observed.cache_write_tokens,
+                        observed.output_tokens,
+                        observed.reasoning_tokens,
+                        observed.total_tokens,
+                    )
+                ):
+                    unknown = True
+                    continue
+                input_tokens = observed.input_tokens
+                cached_tokens = observed.cached_tokens
+                output_tokens = observed.output_tokens
+                if (
+                    input_tokens is None
+                    and cached_tokens is None
+                    and output_tokens is None
+                ) or (
+                    input_tokens is not None
+                    and cached_tokens is not None
+                    and cached_tokens > input_tokens
+                ):
+                    unknown = True
+                    continue
+                # Cache reads and writes are subsets of input; reasoning is a
+                # subset of output. Never add those details to their totals.
+                usage = TokenUsage(
+                    input_other=(input_tokens or 0) - (cached_tokens or 0)
+                    if input_tokens is not None
+                    else 0,
+                    input_cached=cached_tokens or 0,
+                    output=output_tokens or 0,
+                    is_partial=input_tokens is None
+                    or cached_tokens is None
+                    or output_tokens is None,
+                )
+                total = (total or TokenUsage()) + usage
+            if total is not None and unknown:
+                total.is_partial = True
+            await record_usage(
+                provider,
+                db,
+                usage=total,
+                status=status,
+                start_time=start_time,
+                end_time=time.time(),
+                request_kind="test"
+                if call_context.request_kind == "test"
+                else "decision",
+                model=getattr(subject, "model", None),
+                _context=call_context,
+            )
+
+    wrapped_ask._astrbot_usage_wrapped = True
+    provider.ask = wrapped_ask
+    provider._usage_recording_enabled = True
+    provider._usage_recording_db = db
+    return provider
 
 
 def instrument_provider(provider: Any, db: Any) -> Any:

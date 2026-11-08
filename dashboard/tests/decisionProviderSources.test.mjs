@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 import { computed, ref } from 'vue';
 import { parse } from 'vue/compiler-sfc';
+import { defaultContextWindow } from '../src/utils/providerContextDefaults.mjs';
 
 function setup(type = 'openai_decision') {
   const source = readFileSync(new URL('../src/composables/useProviderSources.ts', import.meta.url), 'utf8');
@@ -23,6 +24,7 @@ function setup(type = 'openai_decision') {
     '@/utils/providerUtils': { getProviderIcon() {}, isMonochromeProviderIcon() {} },
     '@/utils/confirmDialog': { useConfirmDialog() {} },
     '@/utils/inputValue': { normalizeTextInput: value => value || '' },
+    '@/utils/providerContextDefaults.mjs': { defaultContextWindow },
     '@/utils/sponsorCatalog': { sponsorCatalog: ref(null), loadSponsorCatalog() {} },
     '@/i18n/composables': { useI18n: () => ({ locale: ref('en-US') }) },
   };

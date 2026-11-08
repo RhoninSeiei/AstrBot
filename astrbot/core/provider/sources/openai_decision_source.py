@@ -295,6 +295,10 @@ class OpenAIDecisionProvider(DecisionProvider):
 
         try:
             return await asyncio.wait_for(bounded(), timeout=self.total_timeout)
+        except asyncio.CancelledError as error:
+            error.attempt_usages = tuple(attempts)
+            error.model = model
+            raise
         except TimeoutError:
             raise DecisionError(
                 "Decisions total request timed out",
