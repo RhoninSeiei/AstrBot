@@ -72,7 +72,7 @@
     "avgTpm": "Average Output TPM",
     "successRate": "Success Rate",
     "windowNote": "Rolling window ending now, unlike the calendar-day total above.",
-    "coverageNote": "Coverage is the share of recorded calls with usage data. Consumption remains unknown when a cancelled or failed call reports none."
+    "coverageNote": "Coverage includes complete or partial usage reports among new-format call records; legacy records are excluded. Unreported consumption remains unknown."
   },
   "modelRanking": {
     "title": "Model Usage Ranking"
