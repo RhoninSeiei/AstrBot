@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from ..decision_observation import DecisionObservation
 from ..entities import (
     DecisionAnswer,
     DecisionBooleanAnswer,
@@ -226,6 +227,7 @@ class OpenAIDecisionProvider(DecisionProvider):
         payload: dict | None,
         retries: int,
         attempts: list[DecisionUsage | None],
+        observation: DecisionObservation | None = None,
     ) -> tuple[Any, httpx.Response]:
         """Send a bounded request with safe retry errors.
 
@@ -235,6 +237,7 @@ class OpenAIDecisionProvider(DecisionProvider):
             payload: Request JSON, or None for model discovery.
             retries: Number of additional attempts.
             attempts: Request-local usage observations for attempted requests.
+            observation: Shared call-local phase observer, when supplied by the caller.
 
         Returns:
             Decoded JSON and response metadata.
@@ -247,6 +250,7 @@ class OpenAIDecisionProvider(DecisionProvider):
         if type(retries) is not int or retries < 0:
             raise ValueError("request_max_retries must be a nonnegative integer")
         model = payload["model"] if payload is not None else self.get_model()
+        observer = observation or DecisionObservation(path)
 
         async def send() -> tuple[Any, httpx.Response]:
             if self._closed:
@@ -255,17 +259,34 @@ class OpenAIDecisionProvider(DecisionProvider):
             if self.keys:
                 headers["Authorization"] = f"Bearer {random.choice(self.keys)}"
             attempts.append(None)
+            observer.attempt = len(attempts)
+            observer.request_role = "unknown"
+            observer.last_status_code = None
+            observer.note("attempt_start")
+            attempt_number = observer.attempt
+
+            async def trace(event: str, info: dict[str, Any]) -> None:
+                try:
+                    if observer.attempt == attempt_number:
+                        await observer.trace(event, info)
+                except Exception:
+                    pass
+
             try:
                 response = await self.client.request(
                     method,
                     f"{self.base_url}/{path}",
                     json=payload,
                     headers=headers,
+                    extensions={"trace": trace},
                 )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as error:
+                observer.note("attempt_failed", error=error)
                 raise _DecisionTransportError("Decisions attempt timed out") from None
-            except httpx.RequestError:
+            except httpx.RequestError as error:
+                observer.note("attempt_failed", error=error)
                 raise _DecisionTransportError("Decisions transport failed") from None
+            observer.note("body_complete", status_code=response.status_code)
             try:
                 body = response.json()
             except (ValueError, UnicodeDecodeError):
@@ -280,6 +301,7 @@ class OpenAIDecisionProvider(DecisionProvider):
             usage = _usage(body)
             attempts[-1] = usage
             if not response.is_success:
+                observer.note("attempt_failed", status_code=response.status_code)
                 raise DecisionError(
                     f"Decisions endpoint returned HTTP {response.status_code}",
                     status_code=response.status_code,
@@ -288,18 +310,30 @@ class OpenAIDecisionProvider(DecisionProvider):
             return body, response
 
         async def bounded() -> tuple[Any, httpx.Response]:
-            async with self.request_semaphore:
-                return await retry_provider_request(
-                    "OpenAI Decisions", send, max_attempts=retries + 1
-                )
+            try:
+                observer.note("queue_enter")
+                async with self.request_semaphore:
+                    observer.note("queue_acquired")
+                    return await retry_provider_request(
+                        "OpenAI Decisions", send, max_attempts=retries + 1
+                    )
+            except TimeoutError as error:
+                # An inner TimeoutError is not evidence that wait_for expired.
+                observer.terminal("error", error=error)
+                raise
 
         try:
-            return await asyncio.wait_for(bounded(), timeout=self.total_timeout)
+            result = await asyncio.wait_for(bounded(), timeout=self.total_timeout)
+            if observation is None:
+                observer.terminal("success")
+            return result
         except asyncio.CancelledError as error:
             error.attempt_usages = tuple(attempts)
             error.model = model
+            observer.terminal("cancelled")
             raise
         except TimeoutError:
+            observer.terminal("timeout")
             raise DecisionError(
                 "Decisions total request timed out",
                 attempt_usages=tuple(attempts),
@@ -308,21 +342,32 @@ class OpenAIDecisionProvider(DecisionProvider):
         except DecisionError as error:
             error.attempt_usages = tuple(attempts)
             error.model = model
+            observer.terminal("error", error=error)
+            raise
+        except BaseException as error:
+            observer.terminal("error", error=error)
             raise
 
     async def get_models(self) -> list[str]:
-        body, _ = await self._request("GET", "models", None, 0, [])
-        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
-            raise DecisionError("Decisions model directory returned invalid data")
-        return sorted(
-            {
-                entry["id"]
-                for entry in body["data"]
-                if isinstance(entry, dict)
-                and isinstance(entry.get("id"), str)
-                and entry["id"].strip()
-            }
-        )
+        observation = DecisionObservation("models")
+        try:
+            body, _ = await self._request("GET", "models", None, 0, [], observation)
+            if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+                raise DecisionError("Decisions model directory returned invalid data")
+            result = sorted(
+                {
+                    entry["id"]
+                    for entry in body["data"]
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("id"), str)
+                    and entry["id"].strip()
+                }
+            )
+        except BaseException as error:
+            observation.terminal("error", error=error)
+            raise
+        observation.terminal("success")
+        return result
 
     async def ask(
         self,
@@ -491,17 +536,23 @@ class OpenAIDecisionProvider(DecisionProvider):
         except (TypeError, ValueError, RecursionError):
             raise ValueError("Decision payload must contain valid JSON") from None
         attempts: list[DecisionUsage | None] = []
-        body, response = await self._request(
-            "POST", "decisions", payload, request_max_retries, attempts
-        )
-        usage = attempts[-1] if attempts else None
+        observation = DecisionObservation("decisions")
         try:
-            answers = self._parse_answers(body, questions)
-        except DecisionError as error:
-            error.usage = usage
-            error.attempt_usages = tuple(attempts)
-            error.model = model
+            body, response = await self._request(
+                "POST", "decisions", payload, request_max_retries, attempts, observation
+            )
+            usage = attempts[-1] if attempts else None
+            try:
+                answers = self._parse_answers(body, questions)
+            except DecisionError as error:
+                error.usage = usage
+                error.attempt_usages = tuple(attempts)
+                error.model = model
+                raise
+        except BaseException as error:
+            observation.terminal("error", error=error)
             raise
+        observation.terminal("success")
         return DecisionResult(
             answers,
             body["model"],

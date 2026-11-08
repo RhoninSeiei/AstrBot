@@ -474,6 +474,8 @@ def instrument_decision_provider(provider: Any, db: Any) -> Any:
 
     @wraps(original_ask)
     async def wrapped_ask(*args: Any, **kwargs: Any):
+        from .decision_observation import current_decision_observation_id
+
         provider_key = (id(asyncio.current_task()), id(provider))
         if provider_key in _active_providers.get():
             return await original_ask(*args, **kwargs)
@@ -482,6 +484,8 @@ def instrument_decision_provider(provider: Any, db: Any) -> Any:
         # Native Decisions carries all attempts in its own request-local result.
         # Shared retry helpers must not reset or add to an enclosing chat ledger.
         ledger_token = current_attempt_ledger.set(None)
+        request_id = str(uuid.uuid4())
+        observation_token = current_decision_observation_id.set(request_id)
         start_time = time.time()
         response = None
         final_error = None
@@ -496,6 +500,7 @@ def instrument_decision_provider(provider: Any, db: Any) -> Any:
             status = "aborted" if isinstance(error, asyncio.CancelledError) else "error"
             raise
         finally:
+            current_decision_observation_id.reset(observation_token)
             current_attempt_ledger.reset(ledger_token)
             _active_providers.reset(active_token)
             subject = response if response is not None else final_error
@@ -559,6 +564,7 @@ def instrument_decision_provider(provider: Any, db: Any) -> Any:
                 status=status,
                 start_time=start_time,
                 end_time=time.time(),
+                request_id=request_id,
                 request_kind="test"
                 if call_context.request_kind == "test"
                 else "decision",
