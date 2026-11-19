@@ -31,7 +31,7 @@ class _SourceQuotaAdapter:
         self.base_url = str(source.get("api_base") or _CODEX_BASE_URL).rstrip("/")
 
     def _build_backend_headers(self) -> dict[str, str]:
-        credentials = self._shared_state.snapshot()
+        self.attempted_version, credentials = self._shared_state.versioned_snapshot()
         access_token = str(credentials.get("oauth_access_token") or "").strip()
         account_id = str(credentials.get("oauth_account_id") or "").strip()
         if not access_token or not account_id:
@@ -219,7 +219,7 @@ class QuotaReader:
         return safe_headers, fingerprint
 
     async def read_source(
-        self, source: dict[str, Any], shared_state: Any
+        self, source: dict[str, Any], shared_state: Any, *, single_attempt: bool = False
     ) -> dict[str, Any]:
         """Read quota using one OAuth source and its live shared credentials.
 
@@ -230,9 +230,13 @@ class QuotaReader:
         Returns:
             A normalized quota snapshot or sanitized status.
         """
-        return await self.read(_SourceQuotaAdapter(source, shared_state))
+        return await self.read(
+            _SourceQuotaAdapter(source, shared_state), single_attempt=single_attempt
+        )
 
-    async def read(self, provider: Any) -> dict[str, Any]:
+    async def read(
+        self, provider: Any, *, single_attempt: bool = False
+    ) -> dict[str, Any]:
         if self._closed:
             return {"status": "closed"}
         if str(getattr(provider, "base_url", "")).rstrip("/") != _CODEX_BASE_URL:
@@ -270,10 +274,20 @@ class QuotaReader:
 
                 if self._closed:
                     return {"status": "closed"}
+                if response.status_code == 401 and isinstance(
+                    provider, _SourceQuotaAdapter
+                ):
+                    return {
+                        "status": "reauth_required",
+                        "http_status": 401,
+                        "_attempted_version": provider.attempted_version,
+                    }
                 current = self._identity(provider)
                 if current is None:
                     return {"status": "unbound"}
                 if current[1] != fingerprint:
+                    if single_attempt:
+                        return {"status": "authorization_changed"}
                     continue
 
                 status = response.status_code

@@ -1,9 +1,12 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
 
 from astrbot.core.config.default import CONFIG_METADATA_3, DEFAULT_CONFIG
 from astrbot.core.provider.oauth.openai_oauth_shared_state import OpenAIOAuthSharedState
+from astrbot.core.provider.oauth.openai_oauth_usage import QuotaReader
 from astrbot.core.provider.oauth.openai_oauth_usage_service import (
     OpenAIOAuthUsageService,
 )
@@ -293,3 +296,92 @@ class UsageServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.run(self.event),
             {"status": "rate_limited", "http_status": 429},
         )
+
+    async def exercise_401(
+        self, second=200, rotate=None, exchange_error=None, before_second_response=None
+    ):
+        source = self.manager._sources[0]
+        source.update(oauth_refresh_token="refresh-one")
+        state = self.manager.get_openai_oauth_shared_state(source["id"], source)
+        headers = []
+
+        async def handler(request):
+            headers.append(request.headers["authorization"])
+            if len(headers) == 1:
+                if rotate:
+                    rotate(state)
+                return httpx.Response(401)
+            if before_second_response:
+                before_second_response(state)
+            return httpx.Response(second, json={"plan_type": "pro"})
+
+        transport = httpx.MockTransport(handler)
+        self.service.reader = QuotaReader(
+            client_factory=lambda **kwargs: httpx.AsyncClient(transport=transport)
+        )
+
+        async def persist(_id, patch, **guard):
+            self.assertIs(guard["expected_source"], source)
+            source.update(patch)
+
+        self.manager._persist_openai_oauth_provider_source_patch = AsyncMock(
+            side_effect=persist
+        )
+        exchange = AsyncMock(
+            return_value={"access_token": "fresh", "refresh_token": "refresh-two"},
+            side_effect=exchange_error,
+        )
+        with patch(
+            "astrbot.core.provider.oauth.openai_oauth.refresh_access_token",
+            exchange,
+        ):
+            result = await self.service.run(self.event)
+        return result, headers, exchange
+
+    async def test_401_refreshes_persists_and_retries_once(self):
+        result, headers, exchange = await self.exercise_401()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(headers, ["Bearer secret-token", "Bearer fresh"])
+        exchange.assert_awaited_once_with("refresh-one", "http://source-proxy:8080")
+        self.assertEqual(self.manager._sources[0]["oauth_refresh_token"], "refresh-two")
+
+    async def test_second_401_keeps_public_error(self):
+        result, headers, exchange = await self.exercise_401(second=401)
+        self.assertEqual(result, {"status": "reauth_required", "http_status": 401})
+        self.assertEqual(len(headers), 2)
+        exchange.assert_awaited_once()
+
+    async def test_401_with_concurrent_refresh_reuses_new_token(self):
+        result, headers, exchange = await self.exercise_401(
+            rotate=lambda state: state.apply({"oauth_access_token": "concurrent"})
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(headers, ["Bearer secret-token", "Bearer concurrent"])
+        exchange.assert_not_awaited()
+
+    async def test_401_after_admin_revoked_never_refreshes(self):
+        result, headers, exchange = await self.exercise_401(
+            rotate=lambda state: self.profiles[self.event.unified_msg_origin].update(
+                admins_id=[]
+            )
+        )
+        self.assertEqual(result, {"status": "not_admin"})
+        exchange.assert_not_awaited()
+        self.assertEqual(len(headers), 1)
+
+    async def test_exchange_failure_hides_secret_and_never_retries(self):
+        result, headers, exchange = await self.exercise_401(
+            exchange_error=ValueError("private upstream details")
+        )
+        self.assertEqual(result, {"status": "unavailable"})
+        self.assertEqual(len(headers), 1)
+
+    async def test_retry_rotation_discards_response_without_third_request(self):
+        result, headers, exchange = await self.exercise_401(
+            before_second_response=lambda state: state.apply(
+                {"oauth_access_token": "another-token"}
+            )
+        )
+        self.assertEqual(result, {"status": "authorization_changed"})
+        self.assertEqual(len(headers), 2)
+        exchange.assert_awaited_once()

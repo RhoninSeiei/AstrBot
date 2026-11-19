@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from copy import deepcopy
 
+from . import openai_oauth
+
 _BUILTIN_OAUTH_PROVIDER_TYPE = "openai_oauth_chat_completion"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CREDENTIAL_FIELDS = {
@@ -68,6 +70,7 @@ class OpenAIOAuthUsageService:
                 key: value
                 for key, value in source.items()
                 if key not in _CREDENTIAL_FIELDS
+                and not (key == "oauth_provider" and value in ("", "openai", None))
             }
         )
 
@@ -197,23 +200,52 @@ class OpenAIOAuthUsageService:
             account_id = str(state.snapshot().get("oauth_account_id") or "")
             if str(source.get("oauth_account_id") or "") != account_id:
                 return {"status": "authorization_changed"}
-            status, _ = self._check(event, origin, target)
-            if status:
-                return {"status": status}
-            if not self._source_still_authorized(
-                target, source, state, source_snapshot, account_id
-            ):
-                return {"status": "authorization_changed"}
 
-            result = await self.reader.read_source(source, state)
-            status, _ = self._check(event, origin, target)
-            if status:
-                return {"status": status}
-            if not self._source_still_authorized(
-                target, source, state, source_snapshot, account_id
-            ):
-                return {"status": "authorization_changed"}
-            return result
+            def authorization_error():
+                status, _ = self._check(event, origin, target)
+                if status:
+                    return status
+                if not self._source_still_authorized(
+                    target, source, state, source_snapshot, account_id
+                ):
+                    return "authorization_changed"
+                return None
+
+            for attempt in range(2):
+                if status := authorization_error():
+                    return {"status": status}
+                if attempt:
+                    result = await self.reader.read_source(
+                        source, state, single_attempt=True
+                    )
+                else:
+                    result = await self.reader.read_source(source, state)
+                version = result.pop("_attempted_version", None)
+                if status := authorization_error():
+                    return {"status": status}
+                if attempt or result.get("http_status") != 401 or version is None:
+                    return result
+                async with state.refresh_lock:
+                    if status := authorization_error():
+                        return {"status": status}
+                    if state.version == version:
+                        manager = self.context.provider_manager
+
+                        async def persist(patch):
+                            await manager._persist_openai_oauth_provider_source_patch(
+                                source["id"],
+                                patch,
+                                expected_source=source,
+                                expected_state=state,
+                                expected_version=state.version,
+                            )
+
+                        if not await state.refresh_locked(
+                            openai_oauth.refresh_access_token,
+                            source.get("proxy", ""),
+                            persist,
+                        ):
+                            return result
         except Exception:
             # Never expose account identifiers or upstream response bodies.
             return {"status": "unavailable"}

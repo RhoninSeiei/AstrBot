@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import inspect
 import json
 import math
 import mimetypes
@@ -499,56 +498,18 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         self.client.api_key = OAUTH_PLACEHOLDER_KEY
 
     def _apply_oauth_token_to_runtime(self, token: dict[str, Any]) -> None:
-        access_token = str(token.get("access_token") or "").strip()
-        refresh_token = str(token.get("refresh_token") or "").strip()
-        patch: dict[str, Any] = {}
-        if access_token:
-            patch["oauth_access_token"] = access_token
-        if refresh_token:
-            patch["oauth_refresh_token"] = refresh_token
-        patch["oauth_expires_at"] = str(token.get("expires_at") or "")
-        patch["oauth_account_email"] = str(
-            token.get("email") or ""
-        ) or self.provider_config.get("oauth_account_email", "")
-        patch["oauth_account_id"] = str(
-            token.get("account_id") or ""
-        ) or self.provider_config.get("oauth_account_id", "")
-        self._oauth_shared_state.apply(patch)
+        self._oauth_shared_state.apply_token(token)
         self._sync_oauth_credentials_from_shared()
 
     async def _refresh_oauth_token(self) -> bool:
-        self._sync_oauth_credentials_from_shared()
-        refresh_version, credentials = self._oauth_shared_state.versioned_snapshot()
-        refresh_token_value = str(credentials.get("oauth_refresh_token") or "").strip()
-        if not refresh_token_value:
-            return False
-
-        token = await refresh_access_token(
-            refresh_token_value,
-            self.provider_config.get("proxy", ""),
-        )
-        if self._oauth_shared_state.version != refresh_version:
+        try:
+            return await self._oauth_shared_state.refresh_locked(
+                refresh_access_token,
+                self.provider_config.get("proxy", ""),
+                self._oauth_persist_callback,
+            )
+        finally:
             self._sync_oauth_credentials_from_shared()
-            return True
-        self._apply_oauth_token_to_runtime(token)
-
-        persist_callback = self._oauth_persist_callback
-        if callable(persist_callback):
-            patch = {
-                "auth_mode": "openai_oauth",
-                "oauth_provider": "openai",
-                "oauth_access_token": self.provider_config["oauth_access_token"],
-                "oauth_refresh_token": self.provider_config["oauth_refresh_token"],
-                "oauth_expires_at": self.provider_config["oauth_expires_at"],
-                "oauth_account_email": self.provider_config.get(
-                    "oauth_account_email", ""
-                ),
-                "oauth_account_id": self.provider_config.get("oauth_account_id", ""),
-            }
-            result = persist_callback(patch)
-            if inspect.isawaitable(result):
-                await result
-        return True
 
     async def _ensure_fresh_oauth_token(self) -> None:
         self._sync_oauth_credentials_from_shared()

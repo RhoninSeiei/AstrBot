@@ -659,6 +659,10 @@ class ProviderManager:
         self,
         provider_source_id: str,
         patch: dict,
+        *,
+        expected_source=None,
+        expected_state=None,
+        expected_version=None,
     ) -> None:
         async with self.resource_lock:
             config = self.acm.default_conf
@@ -667,6 +671,13 @@ class ProviderManager:
             for source in provider_sources:
                 if source.get("id") != provider_source_id:
                     continue
+                if expected_state is not None and (
+                    source is not expected_source
+                    or self._openai_oauth_shared_states.get(provider_source_id)
+                    is not expected_state
+                    or expected_state.version != expected_version
+                ):
+                    return
                 source.update(copy.deepcopy(patch))
                 updated_source = source
                 break

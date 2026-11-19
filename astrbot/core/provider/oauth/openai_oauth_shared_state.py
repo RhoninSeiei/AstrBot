@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from typing import Any
 
 OPENAI_OAUTH_CREDENTIAL_FIELDS = (
@@ -71,6 +72,38 @@ class OpenAIOAuthSharedState:
             self.version += 1
         self._credentials = next_credentials
         return self.version
+
+    def apply_token(self, token: dict[str, Any]) -> None:
+        patch = {
+            "oauth_expires_at": str(token.get("expires_at") or ""),
+            "oauth_account_email": token.get("email")
+            or self._credentials["oauth_account_email"],
+            "oauth_account_id": token.get("account_id")
+            or self._credentials["oauth_account_id"],
+        }
+        for field in ("access_token", "refresh_token"):
+            value = str(token.get(field) or "").strip()
+            if value:
+                patch[f"oauth_{field}"] = value
+        self.apply(patch)
+
+    async def refresh_locked(self, exchange, proxy, persist) -> bool:
+        """Exchange the current refresh token while the caller holds refresh_lock."""
+        version, credentials = self.versioned_snapshot()
+        refresh_token = str(credentials.get("oauth_refresh_token") or "").strip()
+        if not refresh_token:
+            return False
+        token = await exchange(refresh_token, proxy)
+        if self.version != version:
+            return True
+        self.apply_token(token)
+        if callable(persist):
+            patch = self.snapshot()
+            patch.update(auth_mode="openai_oauth", oauth_provider="openai")
+            result = persist(patch)
+            if inspect.isawaitable(result):
+                await result
+        return True
 
     def clear_models_cache(self) -> None:
         """Discard account/backend-specific model names and numeric metadata."""
