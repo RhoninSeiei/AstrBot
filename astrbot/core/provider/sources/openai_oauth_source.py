@@ -80,10 +80,9 @@ _CODEX_REASONING_MODELS = (
     "gpt-6.2-sol",
     "gpt-6.2-astra",
     "gpt-6.1-sol",
-    "gpt-6.1-terra",
     "gpt-6-astra",
 )
-_CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6-sol", "gpt-6-luna")
+_CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna")
 oauth_provider_stat_kind: ContextVar[str] = ContextVar(
     "oauth_provider_stat_kind",
     default="text",
@@ -151,8 +150,18 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                 "gpt-6.2-sol",
                 "gpt-6.2-astra",
                 "gpt-6.1-sol",
-                "gpt-6.1-terra",
             )
+        },
+        "gpt-6.1-terra": {
+            "default_reasoning_effort": "low",
+            "supported_reasoning_efforts": (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ),
         },
         "gpt-6-astra": {
             "default_reasoning_effort": "medium",

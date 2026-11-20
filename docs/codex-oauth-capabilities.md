@@ -13,8 +13,8 @@ Successful catalogs are cached for five minutes. Discovery failures retain the
 last successful catalog, or use the built-in model list when none exists, and
 retry after 30 seconds. Each catalog read is limited to ten seconds and 4 MiB;
 an account or endpoint change discards an in-flight result. Existing configured models are not removed when the
-discovered list changes. The Terra adapter accepts the documented reasoning
-efforts `low`, `medium`, `high`, `xhigh`, and `max`.
+discovered list changes. The Terra adapter accepts the catalog efforts `low`, `medium`, `high`, `xhigh`, and `max`.
+The subscription endpoint also accepts `none` for Terra; the adapter forwards `off` as `none`.
 
 The provider implements incremental text, reasoning and function-call streams.
 Chunks have `is_chunk=True`; the final response contains complete text, tools,

@@ -2410,7 +2410,7 @@ def test_codex_reasoning_models_filter_parameters_and_preserve_tools(model, effo
 
 @pytest.mark.parametrize("effort", ["none", "off", "minimal", "invalid", "ultra"])
 @pytest.mark.parametrize(
-    "model", ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-sol-2026-11-17", "gpt-6.2-astra"]
+    "model", ["gpt-6.1-sol", "gpt-6.2-sol-2026-11-17", "gpt-6.2-astra"]
 )
 def test_new_codex_models_reject_unsupported_reasoning(model, effort):
     provider = _make_provider({"model": model})

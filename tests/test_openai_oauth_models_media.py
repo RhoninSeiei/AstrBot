@@ -113,11 +113,14 @@ async def test_extra_image_with_context_remains_in_chat_and_codex_payload(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
-async def test_terra_reasoning_and_sampling_parameters(effort):
+@pytest.mark.parametrize(
+    "effort", ["none", "off", "low", "medium", "high", "xhigh", "max"]
+)
+@pytest.mark.parametrize("model", ["gpt-6.1-terra", "gpt-6.1-terra-2026-11-17"])
+async def test_terra_reasoning_and_sampling_parameters(model, effort):
     provider = _make_provider(
         {
-            "model": "gpt-6.1-terra",
+            "model": model,
             "custom_extra_body": {
                 "top_p": 0.5,
                 "top_logprobs": 5,
@@ -126,9 +129,9 @@ async def test_terra_reasoning_and_sampling_parameters(effort):
     )
     try:
         params = provider._build_responses_params(
-            {"model": "gpt-6.1-terra", "messages": [], "reasoning_effort": effort}, None
+            {"model": model, "messages": [], "reasoning_effort": effort}, None
         )
-        assert params["reasoning"]["effort"] == effort
+        assert params["reasoning"]["effort"] == ("none" if effort == "off" else effort)
         assert "top_p" not in params
         assert "top_logprobs" not in params
         assert "gpt-6.1-terra" in provider.model_capabilities
