@@ -14,8 +14,7 @@ from typing import Any
 
 import httpx
 
-from astrbot.core.provider.oauth.openai_oauth import decode_jwt_claims
-from astrbot.core.provider.sources.openai_oauth_source import CODEX_CLIENT_VERSION
+from astrbot.core.provider.oauth.openai_oauth import build_codex_headers
 
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -36,27 +35,7 @@ class _SourceQuotaAdapter:
         account_id = str(credentials.get("oauth_account_id") or "").strip()
         if not access_token or not account_id:
             return {}
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
-            "version": CODEX_CLIENT_VERSION,
-            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
-            "Content-Type": "application/json",
-        }
-        claims = decode_jwt_claims(access_token)
-        auth_claims = claims.get("https://api.openai.com/auth")
-        if not isinstance(auth_claims, dict):
-            auth_claims = {}
-        residency = (
-            auth_claims.get("chatgpt_data_residency")
-            or auth_claims.get("chatgpt_compute_residency")
-            or claims.get("chatgpt_data_residency")
-            or claims.get("chatgpt_compute_residency")
-        )
-        if isinstance(residency, str) and residency.strip():
-            headers["x-openai-internal-codex-residency"] = residency.strip()
+        headers = build_codex_headers(access_token, account_id)
         custom_headers = self.provider_config.get("custom_headers")
         if isinstance(custom_headers, dict):
             protected = {"authorization", "chatgpt-account-id", "host", "accept"}

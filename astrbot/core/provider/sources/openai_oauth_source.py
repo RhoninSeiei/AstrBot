@@ -26,7 +26,8 @@ from astrbot.core.provider.context_budget import (
 )
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.oauth.openai_oauth import (
-    decode_jwt_claims,
+    CODEX_CLIENT_VERSION,
+    build_codex_headers,
     refresh_access_token,
 )
 from astrbot.core.provider.oauth.openai_oauth_audio import OpenAIOAuthAudioMixin
@@ -74,7 +75,6 @@ OAUTH_IMAGE_MODEL_ALIASES = frozenset(
 )
 OAUTH_DEFAULT_IMAGE_MODEL = "gpt-image-2.6-sunburst"
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
-CODEX_CLIENT_VERSION = "0.171.0"
 _CODEX_REASONING_MODELS = ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra")
 _CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna")
 oauth_provider_stat_kind: ContextVar[str] = ContextVar(
@@ -548,34 +548,8 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                 "当前 OAuth Source 缺少 chatgpt_account_id，请重新绑定或导入完整 JSON 凭据"
             )
 
-        claims = decode_jwt_claims(access_token)
-        auth_claims = claims.get("https://api.openai.com/auth")
-        residency = ""
-        if isinstance(auth_claims, dict):
-            residency = str(
-                auth_claims.get("chatgpt_data_residency")
-                or auth_claims.get("chatgpt_compute_residency")
-                or ""
-            ).strip()
-        if not residency:
-            residency = str(
-                claims.get("chatgpt_data_residency")
-                or claims.get("chatgpt_compute_residency")
-                or ""
-            ).strip()
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
-            "version": CODEX_CLIENT_VERSION,
-            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        if residency:
-            headers["x-openai-internal-codex-residency"] = residency
+        headers = build_codex_headers(access_token, account_id)
+        headers["Accept"] = "text/event-stream"
         custom_headers = self.provider_config.get("custom_headers")
         if isinstance(custom_headers, dict):
             for key, value in custom_headers.items():

@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+CODEX_CLIENT_VERSION = "0.171.0"
 OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -227,3 +228,29 @@ def _normalize_expires_at(value: Any) -> str:
         except Exception:
             return value.strip()
     return ""
+
+
+def build_codex_headers(access_token: str, account_id: str) -> dict[str, str]:
+    """Build the common Codex client identity and account residency headers."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "chatgpt-account-id": account_id,
+        "OpenAI-Beta": "responses=experimental",
+        "originator": "codex_cli_rs",
+        "version": CODEX_CLIENT_VERSION,
+        "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
+        "Content-Type": "application/json",
+    }
+    claims = decode_jwt_claims(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claims, dict):
+        auth_claims = {}
+    residency = (
+        auth_claims.get("chatgpt_data_residency")
+        or auth_claims.get("chatgpt_compute_residency")
+        or claims.get("chatgpt_data_residency")
+        or claims.get("chatgpt_compute_residency")
+    )
+    if isinstance(residency, str) and residency.strip():
+        headers["x-openai-internal-codex-residency"] = residency.strip()
+    return headers
