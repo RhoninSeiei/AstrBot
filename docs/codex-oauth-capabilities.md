@@ -14,7 +14,7 @@ last successful catalog, or use the built-in model list when none exists, and
 retry after 30 seconds. Each catalog read is limited to ten seconds and 4 MiB;
 an account or endpoint change discards an in-flight result. Existing configured models are not removed when the
 discovered list changes. The Terra adapter accepts the documented reasoning
-efforts `none`, `low`, `medium`, `high`, `xhigh`, and `max`.
+efforts `low`, `medium`, `high`, `xhigh`, and `max`.
 
 The provider implements incremental text, reasoning and function-call streams.
 Chunks have `is_chunk=True`; the final response contains complete text, tools,

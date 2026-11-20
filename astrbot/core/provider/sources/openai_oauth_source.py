@@ -3,6 +3,7 @@ import base64
 import json
 import math
 import mimetypes
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -75,8 +76,14 @@ OAUTH_IMAGE_MODEL_ALIASES = frozenset(
 )
 OAUTH_DEFAULT_IMAGE_MODEL = "gpt-image-2.6-sunburst"
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
-_CODEX_REASONING_MODELS = ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra")
-_CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna")
+_CODEX_REASONING_MODELS = (
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-astra",
+)
+_CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6-sol", "gpt-6-luna")
 oauth_provider_stat_kind: ContextVar[str] = ContextVar(
     "oauth_provider_stat_kind",
     default="text",
@@ -140,18 +147,12 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     "max",
                 ),
             }
-            for model in ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol")
-        },
-        "gpt-6.1-terra": {
-            "default_reasoning_effort": "low",
-            "supported_reasoning_efforts": (
-                "none",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-            ),
+            for model in (
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+            )
         },
         "gpt-6-astra": {
             "default_reasoning_effort": "medium",
@@ -1835,7 +1836,9 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     "reasoning_effort=ultra 需要多代理调度，不能作为单次 Provider 请求发送。"
                 )
             model = str(params["model"] or "").strip().lower()
-            capability = self.model_capabilities.get(model)
+            capability = self.model_capabilities.get(
+                re.sub(r"-[0-9]{4}-[0-9]{2}-[0-9]{2}$", "", model)
+            )
             if capability:
                 supported = capability["supported_reasoning_efforts"]
                 if effort == "max" and effort not in supported and "xhigh" in supported:

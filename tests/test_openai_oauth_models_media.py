@@ -113,7 +113,7 @@ async def test_extra_image_with_context_remains_in_chat_and_codex_payload(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
 async def test_terra_reasoning_and_sampling_parameters(effort):
     provider = _make_provider(
         {

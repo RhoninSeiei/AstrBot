@@ -743,7 +743,7 @@ async def test_oauth_provider_exposes_codex_model_catalog_and_defaults():
             ),
         }
         expected_efforts = ("none", "low", "medium", "high", "xhigh", "max")
-        for model in ["gpt-6.1-terra", *models[5:10]]:
+        for model in models[5:10]:
             assert (
                 provider.model_capabilities[model]["supported_reasoning_efforts"]
                 == expected_efforts
@@ -2409,11 +2409,14 @@ def test_codex_reasoning_models_filter_parameters_and_preserve_tools(model, effo
 
 
 @pytest.mark.parametrize("effort", ["none", "off", "minimal", "invalid", "ultra"])
-def test_gpt61_sol_rejects_unsupported_reasoning(effort):
-    provider = _make_provider({"model": "gpt-6.1-sol"})
+@pytest.mark.parametrize(
+    "model", ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-sol-2026-11-17", "gpt-6.2-astra"]
+)
+def test_new_codex_models_reject_unsupported_reasoning(model, effort):
+    provider = _make_provider({"model": model})
     with pytest.raises(ValueError):
         provider._build_responses_params(
-            {"model": "gpt-6.1-sol", "messages": [], "reasoning_effort": effort}, None
+            {"model": model, "messages": [], "reasoning_effort": effort}, None
         )
 
 
