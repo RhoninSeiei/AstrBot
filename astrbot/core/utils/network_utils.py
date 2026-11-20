@@ -4,6 +4,7 @@ import ssl
 from typing import Any
 
 import httpx
+import httpx2
 
 from astrbot import logger
 from astrbot.utils.http_ssl_common import build_ssl_context_with_certifi
@@ -15,7 +16,7 @@ def is_connection_error(exc: BaseException) -> bool:
     """Check if an exception is a connection/network related error.
 
     Uses explicit exception type checking instead of brittle string matching.
-    Handles httpx network errors, timeouts, and common Python network exceptions.
+    Handles HTTPX and HTTPX2 request errors and common Python network exceptions.
 
     Args:
         exc: The exception to check
@@ -23,20 +24,7 @@ def is_connection_error(exc: BaseException) -> bool:
     Returns:
         True if the exception is a connection/network error
     """
-    # Check for httpx network errors
-    if isinstance(
-        exc,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.ReadTimeout,
-            httpx.WriteTimeout,
-            httpx.PoolTimeout,
-            httpx.NetworkError,
-            httpx.ProxyError,
-            httpx.RequestError,
-        ),
-    ):
+    if isinstance(exc, (httpx.RequestError, httpx2.RequestError)):
         return True
 
     # Check for common Python network errors

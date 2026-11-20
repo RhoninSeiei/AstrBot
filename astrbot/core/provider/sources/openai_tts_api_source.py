@@ -1,6 +1,6 @@
 import os
 
-import httpx
+import httpx2
 from openai import NOT_GIVEN, AsyncOpenAI
 
 from astrbot import logger
@@ -35,7 +35,7 @@ class ProviderOpenAITTSAPI(TTSProvider):
         http_client = None
         if proxy:
             logger.info(f"[OpenAI TTS] 使用代理: {proxy}")
-            http_client = httpx.AsyncClient(proxy=proxy)
+            http_client = httpx2.AsyncClient(proxy=proxy)
         self.client = AsyncOpenAI(
             default_headers=self.request_headers,
             api_key=self.chosen_api_key,

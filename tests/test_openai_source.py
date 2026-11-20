@@ -1,12 +1,12 @@
 import base64
-import builtins
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import httpx2
 import pytest
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai import APIConnectionError, AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from PIL import Image as PILImage
@@ -16,7 +16,11 @@ import astrbot.core.provider.sources.request_retry as request_retry
 from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.sources.groq_source import ProviderGroq
+from astrbot.core.provider.sources.openai_embedding_source import (
+    OpenAIEmbeddingProvider,
+)
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
+from astrbot.core.provider.sources.openai_tts_api_source import ProviderOpenAITTSAPI
 from astrbot.core.utils.media_utils import ResolvedMediaData, file_uri_to_path
 
 
@@ -113,18 +117,24 @@ async def test_query_attempts_exactly_request_max_retries_times(monkeypatch):
     monkeypatch.setattr(request_retry, "REQUEST_RETRY_WAIT_MIN_S", 0)
     monkeypatch.setattr(request_retry, "REQUEST_RETRY_WAIT_MAX_S", 0)
 
-    provider = _make_provider()
+    calls = 0
+
+    async def failing_transport(request):
+        nonlocal calls
+        calls += 1
+        assert request.url.path == "/v1/chat/completions"
+        raise httpx2.ConnectError("temporary connection failure", request=request)
+
+    monkeypatch.setattr(
+        ProviderOpenAIOfficial,
+        "_create_http_client",
+        lambda self, config: httpx2.AsyncClient(
+            transport=httpx2.MockTransport(failing_transport)
+        ),
+    )
+    provider = _make_provider({"api_base": "https://example.test/v1"})
     try:
-        calls = 0
-
-        async def failing_create(**kwargs):
-            nonlocal calls
-            calls += 1
-            raise httpx.ConnectError("temporary connection failure")
-
-        monkeypatch.setattr(provider.client.chat.completions, "create", failing_create)
-
-        with pytest.raises(httpx.ConnectError):
+        with pytest.raises(APIConnectionError):
             await provider._query(
                 payloads={
                     "model": "gpt-4o-mini",
@@ -133,78 +143,23 @@ async def test_query_attempts_exactly_request_max_retries_times(monkeypatch):
                 tools=None,
                 request_max_retries=2,
             )
-
         assert calls == 2
     finally:
         await provider.terminate()
 
 
-def test_create_http_client_uses_openai_httpx_module(monkeypatch):
-    captured: dict[str, object] = {}
-    fake_httpx_module = object()
-
-    from openai import _base_client as openai_base_client
-
-    monkeypatch.setattr(
-        openai_base_client,
-        "httpx",
-        fake_httpx_module,
-        raising=False,
-    )
-
-    def fake_create_proxy_client(
-        provider_label: str,
-        proxy: str | None = None,
-        headers: dict[str, str] | None = None,
-        verify=None,
-        httpx_module=None,
-    ):
-        captured["httpx_module"] = httpx_module
-        return object()
-
-    monkeypatch.setattr(
-        openai_source_module,
-        "create_proxy_client",
-        fake_create_proxy_client,
-    )
-
-    provider = ProviderOpenAIOfficial.__new__(ProviderOpenAIOfficial)
-    provider._create_http_client({"proxy": ""})
-
-    assert captured["httpx_module"] is fake_httpx_module
-
-
-def test_create_http_client_falls_back_to_global_httpx_module(monkeypatch):
-    captured: dict[str, object] = {}
-
-    def fake_create_proxy_client(
-        provider_label: str,
-        proxy: str | None = None,
-        headers: dict[str, str] | None = None,
-        verify=None,
-        httpx_module=None,
-    ):
-        captured["httpx_module"] = httpx_module
-        return object()
-
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "openai" and fromlist:
-            raise ImportError("missing openai._base_client")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(
-        openai_source_module,
-        "create_proxy_client",
-        fake_create_proxy_client,
-    )
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    provider = ProviderOpenAIOfficial.__new__(ProviderOpenAIOfficial)
-    provider._create_http_client({"proxy": ""})
-
-    assert captured["httpx_module"] is openai_source_module.httpx
+@pytest.mark.parametrize(
+    ("adapter", "config"),
+    [
+        (ProviderOpenAIOfficial, {"key": ["test-key"]}),
+        (OpenAIEmbeddingProvider, {"embedding_api_key": "test-key"}),
+        (ProviderOpenAITTSAPI, {"api_key": "test-key"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_sdk_clients_accept_socks_proxy(adapter, config):
+    provider = adapter({**config, "proxy": "socks5://127.0.0.1:9"}, {})
+    await provider.client.close()
 
 
 @pytest.mark.asyncio

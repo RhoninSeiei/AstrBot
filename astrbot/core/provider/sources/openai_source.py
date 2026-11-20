@@ -7,9 +7,8 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
-import httpx
-from openai import AsyncAzureOpenAI, AsyncOpenAI
-from openai._exceptions import NotFoundError
+import httpx2
+from openai import AsyncAzureOpenAI, AsyncOpenAI, NotFoundError
 from openai.lib.streaming.chat._completions import ChatCompletionStreamState
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -346,17 +345,10 @@ class ProviderOpenAIOfficial(Provider):
             image_fallback_used,
         )
 
-    def _create_http_client(self, provider_config: dict) -> httpx.AsyncClient:
-        """创建带代理的 HTTP 客户端"""
-        proxy = provider_config.get("proxy", "")
-        httpx_module: Any = httpx
-        try:
-            from openai import _base_client as openai_base_client
-
-            httpx_module = getattr(openai_base_client, "httpx", httpx)
-        except ImportError:
-            pass
-        return create_proxy_client("OpenAI", proxy, httpx_module=httpx_module)
+    def _create_http_client(self, provider_config: dict) -> httpx2.AsyncClient:
+        return create_proxy_client(
+            "OpenAI", provider_config.get("proxy"), httpx_module=httpx2
+        )
 
     def __init__(self, provider_config, provider_settings) -> None:
         super().__init__(provider_config, provider_settings)
@@ -451,7 +443,7 @@ class ProviderOpenAIOfficial(Provider):
         request_client = self.client.with_options()
         sdk_should_retry = request_client._should_retry
 
-        def should_retry(response: httpx.Response) -> bool:
+        def should_retry(response: httpx2.Response) -> bool:
             if response.status_code == 429:
                 return False
             return sdk_should_retry(response)
