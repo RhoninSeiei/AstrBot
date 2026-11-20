@@ -7,7 +7,7 @@ adapter is not evidence that a particular account is entitled to the endpoint.
 ## Text and hosted search
 
 The model selector discovers visible, API-enabled models from the authenticated
-Codex model catalog, including `gpt-6.1-terra`. Catalog reads share the source's
+Codex model catalog, including `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-sol` and `gpt-6.1-terra`. Catalog reads share the source's
 credentials, refresh lock, and persistence callback with its chat providers.
 Successful catalogs are cached for five minutes. Discovery failures retain the
 last successful catalog, or use the built-in model list when none exists, and

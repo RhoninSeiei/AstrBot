@@ -74,7 +74,9 @@ OAUTH_IMAGE_MODEL_ALIASES = frozenset(
 )
 OAUTH_DEFAULT_IMAGE_MODEL = "gpt-image-2.6-sunburst"
 OAUTH_PLACEHOLDER_KEY = "__openai_oauth__"
-CODEX_CLIENT_VERSION = "0.159.2"
+CODEX_CLIENT_VERSION = "0.171.0"
+_CODEX_REASONING_MODELS = ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra")
+_CODEX_OPTIONAL_REASONING_MODELS = ("gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna")
 oauth_provider_stat_kind: ContextVar[str] = ContextVar(
     "oauth_provider_stat_kind",
     default="text",
@@ -127,18 +129,21 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         "image_websocket": True,
     }
     model_capabilities = {
-        "gpt-6.1-sol": {
-            "default_reasoning_effort": "medium",
-            "supported_reasoning_efforts": (
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-            ),
+        **{
+            model: {
+                "default_reasoning_effort": "low",
+                "supported_reasoning_efforts": (
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                ),
+            }
+            for model in ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol")
         },
         "gpt-6.1-terra": {
-            "default_reasoning_effort": "medium",
+            "default_reasoning_effort": "low",
             "supported_reasoning_efforts": (
                 "none",
                 "low",
@@ -333,26 +338,17 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                     entries = data.get("models") if isinstance(data, dict) else None
                     if not isinstance(entries, list):
                         raise ValueError("Invalid Codex model catalog")
-                    models = list(
-                        dict.fromkeys(
-                            entry["slug"].strip()
-                            for entry in entries
-                            if isinstance(entry, dict)
-                            and isinstance(entry.get("slug"), str)
-                            and entry["slug"].strip()
-                            and entry.get("visibility", "list") == "list"
-                            and entry.get("supported_in_api") is not False
-                        )
-                    )
-                    if not models:
-                        raise ValueError("Empty Codex model catalog")
-                    if getattr(self, "_oauth_media_closed", False):
-                        raise RuntimeError("OAuth provider is closed")
                     metadata = {}
                     for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        slug = entry.get("slug")
                         if (
-                            not isinstance(entry, dict)
-                            or entry.get("slug") not in models
+                            not isinstance(slug, str)
+                            or not (slug := slug.strip())
+                            or slug in metadata
+                            or entry.get("visibility", "list") != "list"
+                            or entry.get("supported_in_api") is False
                         ):
                             continue
                         limits = {
@@ -365,13 +361,19 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
                             "context_window", 0
                         ):
                             limits.pop("max_context_window", None)
-                        if limits:
-                            metadata[entry["slug"]] = limits
+                        metadata[slug] = limits
+                    models = list(metadata)
+                    if not models:
+                        raise ValueError("Empty Codex model catalog")
+                    if getattr(self, "_oauth_media_closed", False):
+                        raise RuntimeError("OAuth provider is closed")
                     self._sync_oauth_credentials_from_shared()
                     if cache_key != (self.base_url, self.account_id):
                         raise ValueError("Codex model catalog account changed")
                     state.models_cache = models
-                    state.models_metadata = metadata
+                    state.models_metadata = {
+                        slug: limits for slug, limits in metadata.items() if limits
+                    }
                     state.models_expires_at = time.monotonic() + 300
                     return list(models)
             except asyncio.CancelledError:
@@ -1880,13 +1882,13 @@ class ProviderOpenAIOAuth(OpenAIOAuthAudioMixin, ProviderOpenAIOfficial):
         params.pop("temperature", None)
         model_name = str(params.get("model") or "").strip().lower()
         if model_name.startswith(
-            ("gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
+            _CODEX_REASONING_MODELS + _CODEX_OPTIONAL_REASONING_MODELS
         ):
             # The Codex backend rejects sampling parameters even without reasoning.
             params.pop("top_p", None)
             params.pop("top_logprobs", None)
-        if model_name.startswith(("gpt-6.1-sol", "gpt-6-astra")) or (
-            model_name.startswith(("gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"))
+        if model_name.startswith(_CODEX_REASONING_MODELS) or (
+            model_name.startswith(_CODEX_OPTIONAL_REASONING_MODELS)
             and reasoning.get("effort") != "none"
         ):
             include = params.get("include")

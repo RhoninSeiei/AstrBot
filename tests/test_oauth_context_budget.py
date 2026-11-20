@@ -245,6 +245,7 @@ async def test_catalog_numeric_metadata_and_model_override_are_cached_without_co
                 "max_context_window": True,
             },
             {"slug": "bad", "context_window": "900000", "max_context_window": 10**15},
+            {"slug": "gpt-6.1-sol", "visibility": "hide", "context_window": 8000},
         ],
     )
     try:
@@ -329,6 +330,8 @@ def test_media_counting_does_not_charge_encoded_image_as_text():
         ("gpt-6-luna", 272000),
         ("gpt-6-astra", 272000),
         ("gpt-6.1-terra", 490000),
+        ("gpt-6.2-sol", 490000),
+        ("gpt-6.2-astra", 272000),
     ],
 )
 async def test_catalog_failure_uses_conservative_known_window(

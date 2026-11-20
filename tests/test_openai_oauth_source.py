@@ -720,7 +720,9 @@ async def test_oauth_provider_exposes_codex_model_catalog_and_defaults():
     try:
         models = await provider.get_models()
 
-        assert models[:8] == [
+        assert models[:10] == [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
             "gpt-6-astra",
@@ -741,7 +743,7 @@ async def test_oauth_provider_exposes_codex_model_catalog_and_defaults():
             ),
         }
         expected_efforts = ("none", "low", "medium", "high", "xhigh", "max")
-        for model in ["gpt-6.1-terra", *models[3:8]]:
+        for model in ["gpt-6.1-terra", *models[5:10]]:
             assert (
                 provider.model_capabilities[model]["supported_reasoning_efforts"]
                 == expected_efforts
@@ -815,8 +817,10 @@ async def test_request_backend_sends_codex_identity_and_residency_headers(
         headers = sent_requests[0]["headers"]
         assert status_code == 200
         assert attempted_version == provider._oauth_shared_state.version
-        assert headers["version"] == "0.159.2"
-        assert headers["User-Agent"] == "codex_cli_rs/0.159.2"
+        assert headers["version"] == oauth_source.CODEX_CLIENT_VERSION
+        assert (
+            headers["User-Agent"] == f"codex_cli_rs/{oauth_source.CODEX_CLIENT_VERSION}"
+        )
         assert headers["x-openai-internal-codex-residency"] == "us"
     finally:
         await provider.terminate()
@@ -2212,8 +2216,12 @@ async def test_generate_image_reads_sse_incrementally(monkeypatch, tmp_path):
         results = await provider.generate_image("draw from streaming response")
 
         assert sent_requests[0]["method"] == "POST"
-        assert sent_requests[0]["headers"]["version"] == "0.159.2"
-        assert sent_requests[0]["headers"]["User-Agent"] == ("codex_cli_rs/0.159.2")
+        assert (
+            sent_requests[0]["headers"]["version"] == oauth_source.CODEX_CLIENT_VERSION
+        )
+        assert sent_requests[0]["headers"]["User-Agent"] == (
+            f"codex_cli_rs/{oauth_source.CODEX_CLIENT_VERSION}"
+        )
         assert sent_requests[0]["headers"]["x-openai-internal-codex-residency"] == "eu"
         assert sent_requests[0]["json"]["stream"] is True
         assert (
@@ -2352,7 +2360,7 @@ async def test_gpt61_sol_catalog_exposes_supported_reasoning():
     try:
         assert "gpt-6.1-sol" in await provider.get_models()
         assert provider.model_capabilities["gpt-6.1-sol"] == {
-            "default_reasoning_effort": "medium",
+            "default_reasoning_effort": "low",
             "supported_reasoning_efforts": ("low", "medium", "high", "xhigh", "max"),
         }
     finally:
@@ -2360,7 +2368,8 @@ async def test_gpt61_sol_catalog_exposes_supported_reasoning():
 
 
 @pytest.mark.parametrize("effort", [None, "low", "medium", "high", "xhigh", "max"])
-def test_gpt61_sol_filters_parameters_and_preserves_tools(effort):
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol"])
+def test_codex_reasoning_models_filter_parameters_and_preserve_tools(model, effort):
     tools = [
         {
             "type": "function",
@@ -2371,7 +2380,7 @@ def test_gpt61_sol_filters_parameters_and_preserves_tools(effort):
     ]
     provider = _make_provider(
         {
-            "model": "gpt-6.1-sol",
+            "model": model,
             "custom_extra_body": {
                 "top_p": 0.8,
                 "top_logprobs": 5,
@@ -2383,11 +2392,11 @@ def test_gpt61_sol_filters_parameters_and_preserves_tools(effort):
             },
         }
     )
-    request = {"model": "gpt-6.1-sol", "messages": [], "tool_choice": "auto"}
+    request = {"model": model, "messages": [], "tool_choice": "auto"}
     if effort is not None:
         request["reasoning_effort"] = effort
     params = provider._build_responses_params(request, None)
-    assert params["model"] == "gpt-6.1-sol"
+    assert params["model"] == model
     if effort is None:
         assert "reasoning" not in params
     else:

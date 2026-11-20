@@ -159,9 +159,9 @@ async def resolve_context_budget(
     metadata = await provider.get_model_context_metadata(model)
     # These are conservative known Codex windows, not the optional extended window.
     known_window = 128000
-    if model.startswith(("gpt-6.1-sol", "gpt-6.1-terra")):
+    if model.startswith(("gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra")):
         known_window = 500000
-    elif model.startswith(("gpt-6-luna", "gpt-6-astra", "gpt-6-sol")):
+    elif model.startswith(("gpt-6.2-astra", "gpt-6-luna", "gpt-6-astra", "gpt-6-sol")):
         known_window = 272000
     advertised_window = metadata.get("context_window", known_window)
     maximum = metadata.get("max_context_window", advertised_window)
