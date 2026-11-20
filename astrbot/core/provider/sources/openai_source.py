@@ -7,7 +7,6 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
-import httpx2
 from openai import AsyncAzureOpenAI, AsyncOpenAI, NotFoundError
 from openai.lib.streaming.chat._completions import ChatCompletionStreamState
 from openai.types.chat.chat_completion import ChatCompletion
@@ -36,6 +35,7 @@ from astrbot.core.utils.network_utils import (
     create_proxy_client,
     is_connection_error,
     log_connection_failure,
+    openai_httpx,
 )
 from astrbot.core.utils.string_utils import normalize_and_dedupe_strings
 
@@ -345,9 +345,9 @@ class ProviderOpenAIOfficial(Provider):
             image_fallback_used,
         )
 
-    def _create_http_client(self, provider_config: dict) -> httpx2.AsyncClient:
+    def _create_http_client(self, provider_config: dict) -> openai_httpx.AsyncClient:
         return create_proxy_client(
-            "OpenAI", provider_config.get("proxy"), httpx_module=httpx2
+            "OpenAI", provider_config.get("proxy"), httpx_module=openai_httpx
         )
 
     def __init__(self, provider_config, provider_settings) -> None:
@@ -443,7 +443,7 @@ class ProviderOpenAIOfficial(Provider):
         request_client = self.client.with_options()
         sdk_should_retry = request_client._should_retry
 
-        def should_retry(response: httpx2.Response) -> bool:
+        def should_retry(response: openai_httpx.Response) -> bool:
             if response.status_code == 429:
                 return False
             return sdk_should_retry(response)

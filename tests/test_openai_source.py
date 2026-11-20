@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-import httpx2
 import pytest
 from openai import APIConnectionError, AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
@@ -22,6 +21,7 @@ from astrbot.core.provider.sources.openai_embedding_source import (
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.provider.sources.openai_tts_api_source import ProviderOpenAITTSAPI
 from astrbot.core.utils.media_utils import ResolvedMediaData, file_uri_to_path
+from astrbot.core.utils.network_utils import openai_httpx
 
 
 class _ErrorWithBody(Exception):
@@ -123,13 +123,13 @@ async def test_query_attempts_exactly_request_max_retries_times(monkeypatch):
         nonlocal calls
         calls += 1
         assert request.url.path == "/v1/chat/completions"
-        raise httpx2.ConnectError("temporary connection failure", request=request)
+        raise openai_httpx.ConnectError("temporary connection failure", request=request)
 
     monkeypatch.setattr(
         ProviderOpenAIOfficial,
         "_create_http_client",
-        lambda self, config: httpx2.AsyncClient(
-            transport=httpx2.MockTransport(failing_transport)
+        lambda self, config: openai_httpx.AsyncClient(
+            transport=openai_httpx.MockTransport(failing_transport)
         ),
     )
     provider = _make_provider({"api_base": "https://example.test/v1"})
