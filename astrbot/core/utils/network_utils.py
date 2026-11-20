@@ -1,13 +1,19 @@
 """Network error handling utilities for providers."""
 
 import ssl
+import sys
 from typing import Any
 
 import httpx
-import httpx2
 
 from astrbot import logger
 from astrbot.utils.http_ssl_common import build_ssl_context_with_certifi
+
+# Match the OpenAI SDK transport selected by the dependency markers.
+if sys.version_info >= (3, 11):
+    import httpx2 as openai_httpx
+else:
+    openai_httpx = httpx
 
 _SYSTEM_SSL_CTX = build_ssl_context_with_certifi()
 
@@ -24,7 +30,7 @@ def is_connection_error(exc: BaseException) -> bool:
     Returns:
         True if the exception is a connection/network error
     """
-    if isinstance(exc, (httpx.RequestError, httpx2.RequestError)):
+    if isinstance(exc, (httpx.RequestError, openai_httpx.RequestError)):
         return True
 
     # Check for common Python network errors
